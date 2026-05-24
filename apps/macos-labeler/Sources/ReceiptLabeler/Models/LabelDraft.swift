@@ -33,6 +33,20 @@ final class LabelDraft {
     /// Where the date came from. "ocr" = found in receipt text; "exif"/"file"
     /// = pulled from image metadata when OCR found none; nil = unknown.
     let dateSource: String?
+    /// All individual OCR observations from the pipeline. Used by the
+    /// BoundingBoxOverlay to render every detection and let the user
+    /// click-to-(re)assign lines to fields.
+    let ocrLines: [OCRKit.OCRLine]
+    /// True when our preferred pipeline failed and we used the fallback.
+    /// Used by the banner to show a warning.
+    let preferredPipelineFailed: Bool
+    let preferredPipelineError: String?
+
+    /// User overrides to the bboxes coming from the pipeline. When the user
+    /// click-assigns an OCR line to a field, we record the line's bbox here.
+    /// Merged into `effectiveBBoxes` for the overlay + into provenance on save.
+    var bboxOverrides: [String: OCRKit.Receipt.BBox] = [:]
+
     private let labelExisting: LabelDocument.LabelMetadata?
 
     // MARK: - Init
@@ -43,6 +57,9 @@ final class LabelDraft {
         self.labelExisting = document.label
         self.source = .existingLabel
         self.dateSource = nil
+        self.ocrLines = []
+        self.preferredPipelineFailed = false
+        self.preferredPipelineError = nil
         self.merchantName = r.header.merchant.name
         self.receiptDate = LabelDraft.parseISODate(r.header.date.value) ?? Date()
         self.total = r.totals.total
@@ -57,7 +74,10 @@ final class LabelDraft {
         sourceFilename: String,
         pipelineId: String,
         rawText: String?,
-        dateSource: String? = nil
+        dateSource: String? = nil,
+        ocrLines: [OCRKit.OCRLine] = [],
+        preferredPipelineFailed: Bool = false,
+        preferredPipelineError: String? = nil
     ) {
         let metadata = LabelDocument.LabelMetadata(
             status: .draft,
@@ -71,6 +91,9 @@ final class LabelDraft {
         self.labelExisting = metadata
         self.source = .preLabel(rawText: rawText)
         self.dateSource = dateSource
+        self.ocrLines = ocrLines
+        self.preferredPipelineFailed = preferredPipelineFailed
+        self.preferredPipelineError = preferredPipelineError
         self.merchantName = receipt.header.merchant.name
         self.receiptDate = LabelDraft.parseISODate(receipt.header.date.value) ?? Date()
         self.total = receipt.totals.total
@@ -118,6 +141,61 @@ final class LabelDraft {
         return false
     }
 
+    // MARK: - BBox overrides + click-assignment
+
+    /// Pipeline bboxes merged with user overrides. Overlay reads from here so
+    /// the moment the user click-assigns a line to a field, the overlay
+    /// reflects it.
+    var effectiveBBoxes: [String: OCRKit.Receipt.BBox] {
+        basis.provenance.bboxes.merging(bboxOverrides) { _, override in override }
+    }
+
+    enum FieldTarget: String, Sendable {
+        case merchant
+        case date
+        case total
+        case subtotal
+        case lineItem
+    }
+
+    /// Assign an OCR line's text + bbox to a field. The form value updates
+    /// immediately and the bbox override is recorded so the overlay highlight
+    /// jumps to the clicked line.
+    func assign(line: OCRKit.OCRLine, to field: FieldTarget) {
+        switch field {
+        case .merchant:
+            merchantName = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            bboxOverrides["merchant.name"] = line.box
+        case .date:
+            if let parsed = LabelDraft.parseLooseDate(line.text) {
+                receiptDate = parsed
+            }
+            bboxOverrides["date.value"] = line.box
+        case .total:
+            if let amount = LabelDraft.parseAmount(line.text) {
+                total = amount
+            }
+            bboxOverrides["totals.total"] = line.box
+        case .subtotal:
+            bboxOverrides["totals.subtotal"] = line.box
+        case .lineItem:
+            // Best-effort: extract description + price from one line, append
+            // as a new line item.
+            let (desc, price) = LabelDraft.splitDescriptionAndPrice(line.text)
+            let item = LineItemDraft(from: OCRKit.Receipt.LineItem(
+                description: desc,
+                quantity: nil,
+                unitPrice: nil,
+                totalPrice: price ?? 0,
+                category: nil
+            ))
+            lineItems.append(item)
+            // Index it under lineItem.NNN
+            let idx = lineItems.count - 1
+            bboxOverrides["lineItem.\(String(format: "%03d", idx))"] = line.box
+        }
+    }
+
     // MARK: - Save
 
     func snapshot(asStatus newStatus: LabelStatus, labeler: String?) -> LabelDocument {
@@ -127,6 +205,7 @@ final class LabelDraft {
         receipt.header.currency = currency
         receipt.totals.total = total
         receipt.lineItems = lineItems.map { $0.asCanonical }
+        receipt.provenance.bboxes = effectiveBBoxes
 
         let metadata = LabelDocument.LabelMetadata(
             status: newStatus,
@@ -137,6 +216,54 @@ final class LabelDraft {
             notes: notes.isEmpty ? nil : notes
         )
         return LabelDocument(receipt: receipt, label: metadata)
+    }
+
+    // MARK: - Parsing helpers (used by click-assign)
+
+    private static func parseLooseDate(_ raw: String) -> Date? {
+        let formats = [
+            "yyyy-MM-dd", "yyyy/MM/dd",
+            "MM/dd/yyyy", "M/d/yyyy", "M/d/yy", "MM/dd/yy",
+            "MM-dd-yyyy", "M-d-yyyy", "M-d-yy",
+            "dd/MM/yyyy", "dd-MM-yyyy",
+            "MMM d, yyyy", "MMM dd, yyyy",
+            "MMMM d, yyyy",
+            "d MMM yyyy", "dd MMM yyyy"
+        ]
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // First, try the whole text. Then try matching a substring containing a date.
+        for fmt in formats {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.dateFormat = fmt
+            df.timeZone = TimeZone(identifier: "UTC")
+            if let d = df.date(from: trimmed) { return d }
+        }
+        // Extract any date-shaped substring and retry
+        if let r = trimmed.range(of: #"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}[/\-]\d{1,2}[/\-]\d{1,2}"#, options: .regularExpression) {
+            return parseLooseDate(String(trimmed[r]))
+        }
+        return nil
+    }
+
+    private static func parseAmount(_ raw: String) -> Decimal? {
+        guard let r = raw.range(of: #"-?\$?\s*\d{1,5}(?:,\d{3})*\.\d{2}"#, options: .regularExpression) else { return nil }
+        let cleaned = String(raw[r])
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: ",", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        return Decimal(string: cleaned, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    private static func splitDescriptionAndPrice(_ raw: String) -> (description: String, price: Decimal?) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let priceRange = trimmed.range(of: #"-?\$?\s*\d{1,5}(?:,\d{3})*\.\d{2}\s*$"#, options: .regularExpression) else {
+            return (trimmed, nil)
+        }
+        let price = parseAmount(String(trimmed[priceRange]))
+        let desc = String(trimmed[trimmed.startIndex..<priceRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return (desc.isEmpty ? trimmed : desc, price)
     }
 
     // MARK: - Date helpers

@@ -66,7 +66,8 @@ public struct VisionOnlyPipeline: OCRPipeline {
             receipt: receipt,
             latencyMs: elapsedMs,
             peakMemoryMB: nil,
-            rawText: rawText
+            rawText: rawText,
+            ocrLines: lines.map { OCRLine(text: $0.text, box: $0.box) }
         )
     }
 

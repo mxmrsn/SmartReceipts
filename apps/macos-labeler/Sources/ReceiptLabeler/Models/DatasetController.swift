@@ -22,6 +22,10 @@ final class DatasetController {
     /// section so the user can verify what the OCR actually saw).
     var pendingExtraction: OCRKit.ExtractionResult?
     var pendingDateSource: ImageMetadata.DateSource?
+    /// When set, the preferred pipeline (e.g. vision-fm) failed and we
+    /// fell back. The form surfaces this in the banner with a tooltip
+    /// showing the error for debugging FM unreliability.
+    var pendingPreferredError: String?
     var isExtracting: Bool = false
 
     /// Saved-vendor directory used by the LabelingView's quick-pick menu.
@@ -70,6 +74,7 @@ final class DatasetController {
         selectedID = id
         pendingExtraction = nil
         pendingDateSource = nil
+        pendingPreferredError = nil
     }
 
     var selectedEntry: DatasetEntry? {
@@ -104,6 +109,7 @@ final class DatasetController {
 
         do {
             let result = try await preferred.extract(image: cgImage, orientation: .up)
+            pendingPreferredError = nil
             stashResult(result, for: entry, pipelineDisplayName: type(of: preferred).displayName)
             return
         } catch {
@@ -112,8 +118,11 @@ final class DatasetController {
                 statusMessage = "Pre-label failed: \(error.localizedDescription)"
                 return
             }
-            // Try the fallback. Tell the user we degraded.
-            statusMessage = "\(type(of: preferred).displayName) unavailable (\(error.localizedDescription)) — falling back…"
+            // Capture the FM error and try the fallback.
+            pendingPreferredError = error.localizedDescription
+            // Also dump to stderr for easier off-screen diagnostics.
+            FileHandle.standardError.write(Data("[\(entry.sourceFilename)] FM failed: \(error.localizedDescription)\n".utf8))
+            statusMessage = "\(type(of: preferred).displayName) unavailable — falling back to \(VisionOnlyPipeline.displayName)…"
             do {
                 let result = try await fallback.extract(image: cgImage, orientation: .up)
                 stashResult(result, for: entry, pipelineDisplayName: "\(VisionOnlyPipeline.displayName) (fallback)")

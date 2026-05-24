@@ -183,7 +183,7 @@ extension Receipt {
     }
 
     /// Bounding box in normalized image coordinates ([0,1] for all four values).
-    public struct BBox: Codable, Sendable, Equatable {
+    public struct BBox: Codable, Sendable, Equatable, Hashable {
         public var x: Double
         public var y: Double
         public var width: Double

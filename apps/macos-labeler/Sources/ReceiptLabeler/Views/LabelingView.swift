@@ -30,7 +30,7 @@ struct LabelingView: View {
         HSplitView {
             ZoomableImageView(
                 url: entry.imageURL,
-                overlay: BoundingBoxOverlay(receipt: draft.basis)
+                overlay: BoundingBoxOverlay(draft: draft)
             )
             .frame(minWidth: 380, idealWidth: 720)
             .layoutPriority(1)
@@ -60,7 +60,10 @@ struct LabelingView: View {
                 sourceFilename: entry.sourceFilename,
                 pipelineId: extraction.receipt.provenance.pipelineId,
                 rawText: extraction.rawText,
-                dateSource: controller.pendingDateSource?.rawValue
+                dateSource: controller.pendingDateSource?.rawValue,
+                ocrLines: extraction.ocrLines,
+                preferredPipelineFailed: controller.pendingPreferredError != nil,
+                preferredPipelineError: controller.pendingPreferredError
             )
         } else {
             let blank = blankCanonicalReceipt(imageId: entry.imageId)
