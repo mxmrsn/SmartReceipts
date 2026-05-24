@@ -175,6 +175,18 @@ final class LabelDraft {
         }
     }
 
+    /// If the field has no bbox yet (commonly because the value came from
+    /// EXIF metadata rather than the receipt text), create a small default
+    /// box at the image center. The user can then drag/resize it into the
+    /// right place using the overlay handles.
+    func ensureBBox(for key: String) {
+        guard effectiveBBoxes[key] == nil else { return }
+        // 30% wide × 5% tall, centered. Reasonable for a single text line.
+        bboxOverrides[key] = OCRKit.Receipt.BBox(
+            x: 0.35, y: 0.475, width: 0.30, height: 0.05
+        )
+    }
+
     /// Move a bbox by a normalized delta. Used by drag gestures on the
     /// selected bbox; clamps so the box stays inside [0,1].
     func translateBBox(key: String, by delta: CGSize) {

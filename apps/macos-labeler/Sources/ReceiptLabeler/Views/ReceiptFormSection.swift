@@ -69,6 +69,15 @@ struct ReceiptFormSection: View {
                 actionBar
             }
         }
+        // When the user selects a field that doesn't have a bbox yet — common
+        // for dates that came from EXIF metadata — create a default-sized
+        // placeholder box at image center so they can immediately drag/resize
+        // it into place.
+        .onChange(of: draft.selectedBBoxKey) { _, newKey in
+            if let key = newKey {
+                draft.ensureBBox(for: key)
+            }
+        }
     }
 
     // MARK: - Header section

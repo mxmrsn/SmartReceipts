@@ -301,28 +301,36 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
     /// Use Apple's NSDataDetector to find any date-shaped text in the OCR
     /// lines, then pick the line whose detected date matches the target
-    /// ISO date. Handles "Feb 4, 2024", "02/04/24", "4-Feb-24", etc. without
-    /// needing case-by-case regex.
+    /// ISO date by Y/M/D components. Handles "Feb 4, 2024", "02/04/24",
+    /// "4-Feb-24", etc. without case-by-case regex.
+    ///
+    /// Important: comparing components rather than going through
+    /// startOfDay avoids the UTC-vs-local-time pitfall — FM's
+    /// "2024-02-04" is just a date, and we don't want a midnight rollover
+    /// to make us miss the match.
     private static func locateDateBBox(
         targetISO: String,
         in lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt.BBox? {
-        let targetFormatter = DateFormatter()
-        targetFormatter.dateFormat = "yyyy-MM-dd"
-        targetFormatter.timeZone = TimeZone(identifier: "UTC")
-        targetFormatter.locale = Locale(identifier: "en_US_POSIX")
-        guard let targetDate = targetFormatter.date(from: targetISO) else { return nil }
-        let targetDay = Calendar(identifier: .gregorian).startOfDay(for: targetDate)
+        // Parse target as Y/M/D directly so timezone doesn't shift it.
+        let parts = targetISO.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        let targetYear = parts[0]
+        let targetMonth = parts[1]
+        let targetDay = parts[2]
 
         guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) else {
             return nil
         }
+        let calendar = Calendar(identifier: .gregorian)
+
         for line in lines {
             let range = NSRange(line.text.startIndex..<line.text.endIndex, in: line.text)
             let matches = detector.matches(in: line.text, options: [], range: range)
             for match in matches {
                 guard let d = match.date else { continue }
-                if Calendar(identifier: .gregorian).startOfDay(for: d) == targetDay {
+                let comps = calendar.dateComponents([.year, .month, .day], from: d)
+                if comps.year == targetYear, comps.month == targetMonth, comps.day == targetDay {
                     return line.box
                 }
             }
