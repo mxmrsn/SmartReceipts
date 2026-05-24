@@ -54,7 +54,10 @@ class Merchant(BaseModel):
 class ReceiptDate(BaseModel):
     model_config = _MODEL_CONFIG
 
-    value: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+    # Year prefix locked to 19 or 20 so a 2-digit-year misread like
+    # '0024-02-04' (a real bug we hit) is rejected at schema-validation time
+    # instead of silently flowing into the bench.
+    value: str = Field(pattern=r"^(19|20)\d{2}-\d{2}-\d{2}$")
     time: Optional[str] = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
 
 

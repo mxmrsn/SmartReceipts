@@ -178,7 +178,9 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         let dateValue: String = {
             let d = x.date.trimmingCharacters(in: .whitespaces)
-            return d.range(of: #"^\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
+            // Year locked to 19xx/20xx so a 2-digit-year misread like
+            // "0024" → "0024-02-04" doesn't sneak past the canonical schema.
+            return d.range(of: #"^(19|20)\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
                 ? d
                 : "1970-01-01"
         }()

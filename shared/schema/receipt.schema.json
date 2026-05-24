@@ -56,8 +56,8 @@
       "properties": {
         "value": {
           "type": "string",
-          "description": "ISO-8601 calendar date, YYYY-MM-DD.",
-          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          "description": "ISO-8601 calendar date, YYYY-MM-DD. Year must start with 19 or 20 — guards against 2-digit-year misreads like '0024-02-04'.",
+          "pattern": "^(19|20)\\d{2}-\\d{2}-\\d{2}$"
         },
         "time": {
           "type": ["string", "null"],

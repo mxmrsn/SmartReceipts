@@ -34,6 +34,7 @@ from bench.report import (
     write_by_field_csv,
     write_html_diffs,
 )
+from bench.lint import lint_all, summarize
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -92,6 +93,44 @@ def verify_label(image_id: str) -> None:
     console.print(f"[green]ok[/green] {image_id} status={sample.label_status} total={sample.label.totals.total}")
 
 
+@app.command()
+def lint(
+    status: Optional[str] = typer.Option(
+        None, help="Filter by label status (e.g. 'verified', 'draft', 'rejected')."
+    ),
+    only_errors: bool = typer.Option(
+        False, "--only-errors", help="Hide warnings — show only severity='error'."
+    ),
+) -> None:
+    """Scan dataset/labels/*.json for data-quality issues (footer rows in
+    lineItems, broken dates, zero totals, placeholder merchants…)."""
+    issues = lint_all(status=status)
+    if only_errors:
+        issues = [i for i in issues if i.severity == "error"]
+    if not issues:
+        console.print("[green]✓[/green] All labels pass lint.")
+        return
+
+    table = Table(title=f"Lint issues ({len(issues)})")
+    table.add_column("image_id")
+    table.add_column("severity")
+    table.add_column("rule")
+    table.add_column("message")
+    for issue in issues:
+        color = "red" if issue.severity == "error" else "yellow"
+        table.add_row(
+            issue.image_id[:8],
+            f"[{color}]{issue.severity}[/{color}]",
+            issue.rule,
+            issue.message,
+        )
+    console.print(table)
+
+    counts = summarize(issues)
+    summary = ", ".join(f"{rule}={n}" for rule, n in sorted(counts.items()))
+    console.print(f"\n[bold]By rule:[/bold] {summary}")
+
+
 # ───────────────────── Full benchmark run ─────────────────────
 
 
@@ -127,13 +166,20 @@ def run(
         f"[bold]{len(label_ids)}[/bold] '{source}' label(s). Output → {out}"
     )
 
-    # Load gold labels once
+    # Load gold labels once. Tolerate file-missing AND schema-validation
+    # failures so a single bad label can't block the entire run — bench lint
+    # is the right tool to fix the underlying file.
     samples = []
     for image_id in label_ids:
         try:
             samples.append(load_label(image_id))
         except FileNotFoundError as e:
             console.print(f"[yellow]skip[/yellow] {image_id}: {e}")
+        except Exception as e:
+            console.print(
+                f"[yellow]skip[/yellow] {image_id}: schema-invalid label "
+                f"({type(e).__name__}: {e}). Run `bench lint` for details."
+            )
     if not samples:
         console.print("[red]No usable labels.[/red]")
         raise typer.Exit(1)
