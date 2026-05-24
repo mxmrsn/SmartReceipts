@@ -1,0 +1,81 @@
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ---- Xcode ----
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.swp
+timeline.xctimeline
+playground.xcworkspace
+
+# Per-user workspace state but keep shared settings
+**/xcshareddata/IDEWorkspaceChecks.plist
+**/xcshareddata/WorkspaceSettings.xcsettings
+
+# ---- Swift Package Manager ----
+.build/
+.swiftpm/
+Package.resolved.user
+.netrc
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+*.cover
+*.pyo
+
+# ---- Bench output ----
+bench/results/
+
+# ---- Dataset (large; never commit) ----
+dataset/images/*
+!dataset/images/.gitkeep
+dataset/labels/*
+!dataset/labels/.gitkeep
+dataset/splits/*
+!dataset/splits/.gitkeep
+
+# ---- Editor / OS ----
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---- Secrets ----
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+
+# ---- Claude / agent scratch ----
+.claude/

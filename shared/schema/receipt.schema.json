@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smartreceipts.local/schema/receipt.schema.json",
+  "title": "Receipt",
+  "description": "Canonical receipt extraction output. Single source of truth shared by the iOS app (OCRKit.Receipt), the macOS labeling tool, and the Python benchmark harness (bench.schema.Receipt).",
+  "type": "object",
+  "required": ["imageId", "header", "lineItems", "totals", "provenance"],
+  "additionalProperties": false,
+  "properties": {
+    "imageId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Stable identifier for the source image. Matches the on-disk filename `dataset/images/{imageId}.jpg`."
+    },
+    "header": { "$ref": "#/$defs/Header" },
+    "lineItems": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/LineItem" }
+    },
+    "totals": { "$ref": "#/$defs/Totals" },
+    "payment": { "$ref": "#/$defs/Payment" },
+    "provenance": { "$ref": "#/$defs/Provenance" }
+  },
+  "$defs": {
+    "Header": {
+      "type": "object",
+      "required": ["merchant", "date", "currency"],
+      "additionalProperties": false,
+      "properties": {
+        "merchant": { "$ref": "#/$defs/Merchant" },
+        "date": { "$ref": "#/$defs/ReceiptDate" },
+        "transactionId": { "type": ["string", "null"] },
+        "currency": {
+          "type": "string",
+          "description": "ISO 4217 currency code. Default 'USD'.",
+          "default": "USD",
+          "pattern": "^[A-Z]{3}$"
+        }
+      }
+    },
+    "Merchant": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "address": { "type": ["string", "null"] },
+        "phone": { "type": ["string", "null"] },
+        "taxId": { "type": ["string", "null"] }
+      }
+    },
+    "ReceiptDate": {
+      "type": "object",
+      "required": ["value"],
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "type": "string",
+          "description": "ISO-8601 calendar date, YYYY-MM-DD.",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+        },
+        "time": {
+          "type": ["string", "null"],
+          "description": "ISO-8601 time-of-day, HH:mm (24h).",
+          "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$"
+        }
+      }
+    },
+    "LineItem": {
+      "type": "object",
+      "required": ["description", "totalPrice"],
+      "additionalProperties": false,
+      "properties": {
+        "description": { "type": "string" },
+        "quantity": { "type": ["number", "null"] },
+        "unitPrice": { "type": ["number", "null"] },
+        "totalPrice": { "type": "number" },
+        "category": { "$ref": "#/$defs/Category" }
+      }
+    },
+    "Category": {
+      "type": ["string", "null"],
+      "enum": [
+        "Food",
+        "Fuel",
+        "Groceries",
+        "Office",
+        "Transport",
+        "Lodging",
+        "Entertainment",
+        "Health",
+        "Other",
+        null
+      ]
+    },
+    "Totals": {
+      "type": "object",
+      "required": ["tax", "total"],
+      "additionalProperties": false,
+      "properties": {
+        "subtotal": { "type": ["number", "null"] },
+        "tax": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TaxLine" }
+        },
+        "discount": { "type": ["number", "null"] },
+        "tip": { "type": ["number", "null"] },
+        "serviceCharge": { "type": ["number", "null"] },
+        "total": { "type": "number" }
+      }
+    },
+    "TaxLine": {
+      "type": "object",
+      "required": ["label", "amount"],
+      "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string" },
+        "rate": { "type": ["number", "null"] },
+        "amount": { "type": "number" }
+      }
+    },
+    "Payment": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "type": ["string", "null"],
+          "enum": ["cash", "card", "check", "other", null]
+        },
+        "cardLast4": {
+          "type": ["string", "null"],
+          "pattern": "^\\d{4}$"
+        }
+      }
+    },
+    "Provenance": {
+      "type": "object",
+      "required": ["pipelineId", "modelVersion", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "pipelineId": { "type": "string" },
+        "modelVersion": { "type": "string" },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "fieldConfidence": {
+          "type": "object",
+          "description": "Per-field confidence in [0,1]. Keys are dotted field paths like 'merchant.name' or 'totals.total'.",
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+        },
+        "bboxes": {
+          "type": "object",
+          "description": "Per-field bounding boxes in normalized image coordinates [0,1]. Keys are dotted field paths.",
+          "additionalProperties": { "$ref": "#/$defs/BBox" }
+        }
+      }
+    },
+    "BBox": {
+      "type": "object",
+      "required": ["x", "y", "width", "height"],
+      "additionalProperties": false,
+      "properties": {
+        "x": { "type": "number", "minimum": 0, "maximum": 1 },
+        "y": { "type": "number", "minimum": 0, "maximum": 1 },
+        "width": { "type": "number", "minimum": 0, "maximum": 1 },
+        "height": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    }
+  }
+}
