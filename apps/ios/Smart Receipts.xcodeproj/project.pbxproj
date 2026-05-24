@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		AABBCC0000000000000000A3 /* OCRKit in Frameworks */ = {isa = PBXBuildFile; productRef = AABBCC0000000000000000A2 /* OCRKit */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		5F91B7F42FC373FB007A40B0 /* Smart Receipts.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Smart Receipts.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AABBCC0000000000000000A3 /* OCRKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = "Smart Receipts";
 			packageProductDependencies = (
+				AABBCC0000000000000000A2 /* OCRKit */,
 			);
 			productName = "Smart Receipts";
 			productReference = 5F91B7F42FC373FB007A40B0 /* Smart Receipts.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = 5F91B7EB2FC373FB007A40B0;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				AABBCC0000000000000000A1 /* XCLocalSwiftPackageReference "../../packages/OCRKit" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 5F91B7F52FC373FB007A40B0 /* Products */;
 			projectDirPath = "";
@@ -256,6 +265,7 @@
 				DEVELOPMENT_TEAM = NQH63R4B5X;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Smart Receipts uses the camera to scan paper receipts on-device. No images leave your phone.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -288,6 +298,7 @@
 				DEVELOPMENT_TEAM = NQH63R4B5X;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Smart Receipts uses the camera to scan paper receipts on-device. No images leave your phone.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -332,6 +343,20 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		AABBCC0000000000000000A1 /* XCLocalSwiftPackageReference "../../packages/OCRKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "../../packages/OCRKit";
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		AABBCC0000000000000000A2 /* OCRKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = OCRKit;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 5F91B7EC2FC373FB007A40B0 /* Project object */;
 }

@@ -1,21 +1,15 @@
-//
-//  Smart_ReceiptsApp.swift
-//  Smart Receipts
-//
-//  Created by Coring on 5/24/26.
-//
-
-import SwiftUI
 import SwiftData
+import SwiftUI
 
 @main
 struct Smart_ReceiptsApp: App {
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            Receipt.self,
+            ReceiptLineItem.self
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
-
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])
         } catch {
@@ -25,7 +19,7 @@ struct Smart_ReceiptsApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
         .modelContainer(sharedModelContainer)
     }
