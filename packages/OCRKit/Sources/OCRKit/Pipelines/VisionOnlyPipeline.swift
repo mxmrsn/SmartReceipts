@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import Vision
 
 /// Baseline pipeline: Apple Vision text recognition + lightweight regex/heuristic
@@ -16,7 +17,7 @@ public struct VisionOnlyPipeline: OCRPipeline {
 
     public init() {}
 
-    public func extract(image: CGImage) async throws -> ExtractionResult {
+    public func extract(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> ExtractionResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
 
         let request = VNRecognizeTextRequest()
@@ -24,7 +25,7 @@ public struct VisionOnlyPipeline: OCRPipeline {
         request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en-US"]
 
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
         do {
             try handler.perform([request])
         } catch {

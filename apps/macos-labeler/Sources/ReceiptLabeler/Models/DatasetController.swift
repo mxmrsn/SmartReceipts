@@ -21,7 +21,11 @@ final class DatasetController {
     /// reads both `.receipt` (for field values) and `.rawText` (for the raw OCR
     /// section so the user can verify what the OCR actually saw).
     var pendingExtraction: OCRKit.ExtractionResult?
+    var pendingDateSource: ImageMetadata.DateSource?
     var isExtracting: Bool = false
+
+    /// Saved-vendor directory used by the LabelingView's quick-pick menu.
+    let vendorStore = VendorStore()
 
     var store: LabelStore { LabelStore(datasetDirectory: datasetDirectory) }
 
@@ -65,6 +69,7 @@ final class DatasetController {
     func select(_ id: UUID?) {
         selectedID = id
         pendingExtraction = nil
+        pendingDateSource = nil
     }
 
     var selectedEntry: DatasetEntry? {
@@ -83,7 +88,11 @@ final class DatasetController {
         isExtracting = true
         defer { isExtracting = false }
 
-        guard let nsImage = NSImage(contentsOf: entry.imageURL),
+        // ImageLoader returns an upright NSImage (EXIF orientation already
+        // baked into the pixels). Its cgImage matches its .size, which matches
+        // the SwiftUI display, which matches Vision's normalization — so the
+        // bbox overlay aligns with the visible image.
+        guard let nsImage = ImageLoader.shared.fullImage(for: entry.imageURL),
               let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
         else {
             statusMessage = "Could not load image: \(entry.sourceFilename)"
@@ -94,7 +103,7 @@ final class DatasetController {
         let fallback = VisionOnlyPipeline()
 
         do {
-            let result = try await preferred.extract(image: cgImage)
+            let result = try await preferred.extract(image: cgImage, orientation: .up)
             stashResult(result, for: entry, pipelineDisplayName: type(of: preferred).displayName)
             return
         } catch {
@@ -106,7 +115,7 @@ final class DatasetController {
             // Try the fallback. Tell the user we degraded.
             statusMessage = "\(type(of: preferred).displayName) unavailable (\(error.localizedDescription)) — falling back…"
             do {
-                let result = try await fallback.extract(image: cgImage)
+                let result = try await fallback.extract(image: cgImage, orientation: .up)
                 stashResult(result, for: entry, pipelineDisplayName: "\(VisionOnlyPipeline.displayName) (fallback)")
             } catch {
                 statusMessage = "Both pipelines failed: \(error.localizedDescription)"
@@ -117,13 +126,29 @@ final class DatasetController {
     private func stashResult(_ result: OCRKit.ExtractionResult, for entry: DatasetEntry, pipelineDisplayName: String) {
         var canonical = result.receipt
         canonical.imageId = entry.imageId  // anchor to the dataset-stable id
+
+        // Date fallback: if the pipeline returned the sentinel "1970-01-01"
+        // (meaning it couldn't find a date on the receipt), read EXIF /
+        // file metadata. Track the source for the form to badge.
+        var dateSource: ImageMetadata.DateSource? = nil
+        if canonical.header.date.value == "1970-01-01" {
+            if let (date, source) = ImageMetadata.creationDate(at: entry.imageURL) {
+                canonical.header.date.value = ImageMetadata.formatISODate(date)
+                canonical.provenance.fieldConfidence["date.value"] = 0.6  // medium — metadata, not OCR
+                dateSource = source
+            }
+        }
+
         pendingExtraction = OCRKit.ExtractionResult(
             receipt: canonical,
             latencyMs: result.latencyMs,
             peakMemoryMB: result.peakMemoryMB,
             rawText: result.rawText
         )
-        statusMessage = "Pre-label by \(pipelineDisplayName) — \(result.latencyMs) ms · \(entry.sourceFilename)"
+        pendingDateSource = dateSource
+
+        let dateNote = dateSource.map { " · date from \($0.rawValue.uppercased())" } ?? ""
+        statusMessage = "Pre-label by \(pipelineDisplayName) — \(result.latencyMs) ms\(dateNote) · \(entry.sourceFilename)"
     }
 
     // MARK: - Saving
@@ -135,6 +160,11 @@ final class DatasetController {
         }
         do {
             try store.save(doc, imageId: entry.imageId)
+            // Auto-add merchant to the vendor store on Verify so subsequent
+            // receipts from the same place get a one-click apply.
+            if doc.label.status == .verified {
+                vendorStore.record(doc.receipt.header.merchant.name)
+            }
             statusMessage = "Saved \(doc.label.status.displayName) — \(entry.sourceFilename)"
             reload()
             select(entry.imageId)  // keep selection on the same entry

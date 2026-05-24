@@ -1,9 +1,16 @@
 import AppKit
 import Foundation
+import ImageIO
 
+/// Loads images upright (EXIF orientation already applied) so that Vision's
+/// normalized bbox coords map cleanly onto the displayed image. If we let
+/// NSImage handle this lazily it returns the oriented size but the raw
+/// unrotated CGImage, which makes Vision normalize against the wrong aspect
+/// and our bounding boxes land outside the visible image.
+///
 /// Tiny in-memory thumbnail cache. Decoding HEIC/JPEG is expensive; once we
 /// have a thumbnail at the requested pixel size we keep it around for the
-/// lifetime of the process. Roughly 1000 thumbnails @ ~64KB each = 64 MB.
+/// lifetime of the process.
 @MainActor
 final class ImageLoader {
     static let shared = ImageLoader()
@@ -15,40 +22,39 @@ final class ImageLoader {
         let pixelSize: CGFloat
     }
 
+    /// Full-size upright image for the detail pane. Large maxPixelSize so OCR
+    /// still has detail; ImageIO downsamples if the source is huge.
+    func fullImage(for url: URL) -> NSImage? {
+        loadUpright(at: url, maxPixelSize: 6000)
+    }
+
     func thumbnail(for url: URL, pixelSize: CGFloat = 160) -> NSImage? {
         let key = Key(url: url, pixelSize: pixelSize)
         if let cached = thumbCache[key] { return cached }
-        guard let image = NSImage(contentsOf: url) else { return nil }
-        let thumb = image.resized(toFit: NSSize(width: pixelSize, height: pixelSize))
+        // Request 2x for Retina sharpness.
+        guard let thumb = loadUpright(at: url, maxPixelSize: pixelSize * 2) else { return nil }
         thumbCache[key] = thumb
         return thumb
     }
 
-    /// Full-size image for the detail pane. Not cached — typically only one is
-    /// in view at a time.
-    func fullImage(for url: URL) -> NSImage? {
-        NSImage(contentsOf: url)
-    }
-}
+    // MARK: - ImageIO upright loader
 
-private extension NSImage {
-    /// Downscale to fit within `target` while preserving aspect ratio.
-    func resized(toFit target: NSSize) -> NSImage {
-        let original = self.size
-        guard original.width > 0, original.height > 0 else { return self }
-        let scale = min(target.width / original.width, target.height / original.height, 1.0)
-        let newSize = NSSize(width: original.width * scale, height: original.height * scale)
-
-        let out = NSImage(size: newSize)
-        out.lockFocus()
-        NSGraphicsContext.current?.imageInterpolation = .medium
-        self.draw(
-            in: NSRect(origin: .zero, size: newSize),
-            from: NSRect(origin: .zero, size: original),
-            operation: .copy,
-            fraction: 1.0
-        )
-        out.unlockFocus()
-        return out
+    private func loadUpright(at url: URL, maxPixelSize: CGFloat) -> NSImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            return NSImage(contentsOf: url)  // ultimate fallback
+        }
+        let options: [CFString: Any] = [
+            kCGImageSourceShouldCacheImmediately: true,
+            // Apply EXIF orientation to the produced thumbnail bitmap.
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return NSImage(contentsOf: url)
+        }
+        // Use pixel dimensions as logical size so SwiftUI displays + Vision
+        // normalization agree on aspect ratio.
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
     }
 }

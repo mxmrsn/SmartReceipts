@@ -1,5 +1,6 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 
 /// Uniform interface for any OCR + structured-extraction pipeline.
 ///
@@ -18,7 +19,19 @@ public protocol OCRPipeline: Sendable {
     /// so benchmark results are reproducible across model updates.
     static var modelVersion: String { get }
 
-    func extract(image: CGImage) async throws -> ExtractionResult
+    /// Extract receipt data from an image. `orientation` tells Vision how to
+    /// interpret the input — critical for HEIC/JPEG photos which carry EXIF
+    /// rotation metadata; without it, bbox coordinates land outside the
+    /// displayed image.
+    func extract(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> ExtractionResult
+}
+
+public extension OCRPipeline {
+    /// Convenience for callers that always pass upright images (e.g. iOS
+    /// `VNDocumentCameraViewController` output).
+    func extract(image: CGImage) async throws -> ExtractionResult {
+        try await extract(image: image, orientation: .up)
+    }
 }
 
 public struct ExtractionResult: Codable, Sendable {

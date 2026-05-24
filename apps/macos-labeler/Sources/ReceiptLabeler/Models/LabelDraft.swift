@@ -30,6 +30,9 @@ final class LabelDraft {
     // Immutable context
     let source: Source
     let basis: OCRKit.Receipt
+    /// Where the date came from. "ocr" = found in receipt text; "exif"/"file"
+    /// = pulled from image metadata when OCR found none; nil = unknown.
+    let dateSource: String?
     private let labelExisting: LabelDocument.LabelMetadata?
 
     // MARK: - Init
@@ -39,6 +42,7 @@ final class LabelDraft {
         self.basis = r
         self.labelExisting = document.label
         self.source = .existingLabel
+        self.dateSource = nil
         self.merchantName = r.header.merchant.name
         self.receiptDate = LabelDraft.parseISODate(r.header.date.value) ?? Date()
         self.total = r.totals.total
@@ -52,7 +56,8 @@ final class LabelDraft {
         fromPreLabel receipt: OCRKit.Receipt,
         sourceFilename: String,
         pipelineId: String,
-        rawText: String?
+        rawText: String?,
+        dateSource: String? = nil
     ) {
         let metadata = LabelDocument.LabelMetadata(
             status: .draft,
@@ -65,6 +70,7 @@ final class LabelDraft {
         self.basis = receipt
         self.labelExisting = metadata
         self.source = .preLabel(rawText: rawText)
+        self.dateSource = dateSource
         self.merchantName = receipt.header.merchant.name
         self.receiptDate = LabelDraft.parseISODate(receipt.header.date.value) ?? Date()
         self.total = receipt.totals.total

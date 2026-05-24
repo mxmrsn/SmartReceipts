@@ -28,16 +28,20 @@ struct LabelingView: View {
 
     private func workspace(draft: LabelDraft) -> some View {
         HSplitView {
-            ZoomableImageView(url: entry.imageURL)
-                .frame(minWidth: 380, idealWidth: 720)
-                .layoutPriority(1)
+            ZoomableImageView(
+                url: entry.imageURL,
+                overlay: BoundingBoxOverlay(receipt: draft.basis)
+            )
+            .frame(minWidth: 380, idealWidth: 720)
+            .layoutPriority(1)
             ReceiptFormSection(
                 draft: draft,
+                vendorStore: controller.vendorStore,
                 onSaveDraft: { save(draft: draft, as: .draft) },
                 onVerify:    { save(draft: draft, as: .verified) },
                 onReject:    { save(draft: draft, as: .rejected) }
             )
-            .frame(minWidth: 300, idealWidth: 340, maxWidth: 460)
+            .frame(minWidth: 320, idealWidth: 360, maxWidth: 500)
         }
     }
 
@@ -55,7 +59,8 @@ struct LabelingView: View {
                 fromPreLabel: extraction.receipt,
                 sourceFilename: entry.sourceFilename,
                 pipelineId: extraction.receipt.provenance.pipelineId,
-                rawText: extraction.rawText
+                rawText: extraction.rawText,
+                dateSource: controller.pendingDateSource?.rawValue
             )
         } else {
             let blank = blankCanonicalReceipt(imageId: entry.imageId)

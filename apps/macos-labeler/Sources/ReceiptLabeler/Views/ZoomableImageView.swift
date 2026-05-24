@@ -4,35 +4,52 @@ import SwiftUI
 /// Scroll-and-zoom image viewer with fit-to-window default, a slider, +/−
 /// buttons, ⌘0/⌘1/⌘+/⌘− shortcuts, and a percent readout. Built on top of
 /// `ImageLoader` so we never decode the same image twice.
-struct ZoomableImageView: View {
+struct ZoomableImageView<Overlay: View>: View {
 
     let url: URL
+    let overlay: Overlay
 
     @State private var image: NSImage?
     @State private var zoom: CGFloat = 1.0
     @State private var fitZoom: CGFloat = 1.0
     @State private var containerSize: CGSize = .zero
+    @State private var showOverlay: Bool = true
 
     private let minZoom: CGFloat = 0.05
     private let maxZoom: CGFloat = 4.0
+
+    init(url: URL, @ViewBuilder overlay: () -> Overlay) {
+        self.url = url
+        self.overlay = overlay()
+    }
+
+    init(url: URL, overlay: Overlay) {
+        self.url = url
+        self.overlay = overlay
+    }
 
     var body: some View {
         GeometryReader { geo in
             ScrollView([.horizontal, .vertical]) {
                 if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .interpolation(.medium)
-                        .frame(
-                            width: image.size.width * zoom,
-                            height: image.size.height * zoom
-                        )
-                        .padding(16)
-                        .frame(
-                            minWidth: geo.size.width,
-                            minHeight: geo.size.height,
-                            alignment: .center
-                        )
+                    ZStack(alignment: .topLeading) {
+                        Image(nsImage: image)
+                            .resizable()
+                            .interpolation(.medium)
+                        if showOverlay {
+                            overlay
+                        }
+                    }
+                    .frame(
+                        width: image.size.width * zoom,
+                        height: image.size.height * zoom
+                    )
+                    .padding(16)
+                    .frame(
+                        minWidth: geo.size.width,
+                        minHeight: geo.size.height,
+                        alignment: .center
+                    )
                 } else {
                     ProgressView()
                         .frame(
@@ -90,6 +107,15 @@ struct ZoomableImageView: View {
                 .help("Actual size (⌘1)")
                 .keyboardShortcut("1", modifiers: [.command])
 
+            Divider().frame(height: 18)
+
+            Toggle(isOn: $showOverlay) {
+                Image(systemName: showOverlay ? "viewfinder" : "viewfinder.slash")
+            }
+            .toggleStyle(.button)
+            .help("Toggle detected-field bounding boxes (⌘B)")
+            .keyboardShortcut("b", modifiers: [.command])
+
             Spacer(minLength: 8)
 
             Text("\(Int((zoom * 100).rounded()))%")
@@ -130,6 +156,13 @@ struct ZoomableImageView: View {
         if initial {
             zoom = fitZoom
         }
+    }
+}
+
+extension ZoomableImageView where Overlay == EmptyView {
+    init(url: URL) {
+        self.url = url
+        self.overlay = EmptyView()
     }
 }
 

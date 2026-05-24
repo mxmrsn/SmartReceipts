@@ -363,58 +363,94 @@ enum ReceiptHeuristicParser {
         guard start < end, start < lines.count else { return items }
         let upper = min(end, lines.count)
 
-        for i in start..<upper {
+        let priceOnlyRegex = #"^\s*-?\$?\s*\d{1,5}(?:,\d{3})*\.\d{2}\s*$"#
+        let adjacencyThreshold: Double = 0.04   // ≈ 4% of image height
+
+        var i = start
+        while i < upper {
             let raw = lines[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard raw.count >= 4 else { continue }
+            guard raw.count >= 4 else { i += 1; continue }
 
             let lc = raw.lowercased()
-            if itemSkipKeywords.contains(where: { lc.contains($0) }) { continue }
-            // Skip address-y or contact-y lines that snuck past the header
-            if raw.contains("@") || lc.contains("www.") { continue }
-            if raw.range(of: #"\b\d{3}-\d{4}\b|\(\d{3}\)"#, options: .regularExpression) != nil { continue }
+            if itemSkipKeywords.contains(where: { lc.contains($0) }) { i += 1; continue }
+            if raw.contains("@") || lc.contains("www.") { i += 1; continue }
+            if raw.range(of: #"\b\d{3}-\d{4}\b|\(\d{3}\)"#, options: .regularExpression) != nil { i += 1; continue }
 
-            // Require a trailing money amount
-            guard let priceRange = raw.range(of: itemTrailingAmount, options: .regularExpression),
-                  let price = parseDecimal(String(raw[priceRange]))
-            else { continue }
-
-            var description = raw[raw.startIndex..<priceRange.lowerBound]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            // Trim a trailing "@ unit_price" if present (kept for unitPrice later, ignored for v1)
-            if let atRange = description.range(of: #"\s+@\s*\$?\d+(?:\.\d{1,2})?\s*$"#, options: .regularExpression) {
-                description = String(description[description.startIndex..<atRange.lowerBound])
-                    .trimmingCharacters(in: .whitespaces)
+            // === Case A: line ends in a price → description + price on same row ===
+            if let priceRange = raw.range(of: itemTrailingAmount, options: .regularExpression),
+               let price = parseDecimal(String(raw[priceRange])) {
+                var description = raw[raw.startIndex..<priceRange.lowerBound]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if let atRange = description.range(of: #"\s+@\s*\$?\d+(?:\.\d{1,2})?\s*$"#, options: .regularExpression) {
+                    description = String(description[description.startIndex..<atRange.lowerBound])
+                        .trimmingCharacters(in: .whitespaces)
+                }
+                let (cleanDesc, quantity) = extractQuantityPrefix(description)
+                if isValidDescription(cleanDesc) {
+                    items.append(Receipt.LineItem(
+                        description: cleanDesc,
+                        quantity: quantity,
+                        unitPrice: nil,
+                        totalPrice: price,
+                        category: nil
+                    ))
+                }
+                i += 1
+                continue
             }
 
-            // Quantity prefix detection: "2 ITEM", "2x ITEM", "2 @ ITEM"
-            var quantity: Decimal?
-            if let qRange = description.range(of: #"^(\d+(?:\.\d+)?)\s*(?:x|X|@)?\s+"#, options: .regularExpression) {
-                let qText = description[qRange]
-                    .replacingOccurrences(of: "x", with: "")
-                    .replacingOccurrences(of: "X", with: "")
-                    .replacingOccurrences(of: "@", with: "")
-                    .trimmingCharacters(in: .whitespaces)
-                if let q = Decimal(string: qText, locale: Locale(identifier: "en_US_POSIX")), q > 0, q < 1000 {
-                    quantity = q
-                    description = String(description[qRange.upperBound...])
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
+            // === Case B: description-only line; next row is price-only at same Y ===
+            // Common on receipts where the price is right-aligned in a different
+            // OCR observation than the description text.
+            if i + 1 < upper {
+                let next = lines[i + 1].text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let nextLC = next.lowercased()
+                let isPriceOnly = next.range(of: priceOnlyRegex, options: .regularExpression) != nil
+                let isNearby = abs(lines[i + 1].box.y - lines[i].box.y) <= adjacencyThreshold
+                let nextIsSkip = itemSkipKeywords.contains(where: { nextLC.contains($0) })
+
+                if isPriceOnly, isNearby, !nextIsSkip, let price = parseDecimal(next) {
+                    let (cleanDesc, quantity) = extractQuantityPrefix(raw)
+                    if isValidDescription(cleanDesc) {
+                        items.append(Receipt.LineItem(
+                            description: cleanDesc,
+                            quantity: quantity,
+                            unitPrice: nil,
+                            totalPrice: price,
+                            category: nil
+                        ))
+                    }
+                    i += 2
+                    continue
                 }
             }
 
-            // Filter clearly junk descriptions
-            let letterCount = description.filter(\.isLetter).count
-            if letterCount < 2 { continue }
-            if description.count > 80 { continue }
-
-            items.append(Receipt.LineItem(
-                description: description,
-                quantity: quantity,
-                unitPrice: nil,
-                totalPrice: price,
-                category: nil
-            ))
+            i += 1
         }
         return items
+    }
+
+    private static func extractQuantityPrefix(_ raw: String) -> (description: String, quantity: Decimal?) {
+        var description = raw
+        var quantity: Decimal?
+        if let qRange = description.range(of: #"^(\d+(?:\.\d+)?)\s*(?:x|X|@)?\s+"#, options: .regularExpression) {
+            let qText = description[qRange]
+                .replacingOccurrences(of: "x", with: "")
+                .replacingOccurrences(of: "X", with: "")
+                .replacingOccurrences(of: "@", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            if let q = Decimal(string: qText, locale: Locale(identifier: "en_US_POSIX")), q > 0, q < 1000 {
+                quantity = q
+                description = String(description[qRange.upperBound...])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return (description, quantity)
+    }
+
+    private static func isValidDescription(_ description: String) -> Bool {
+        let letterCount = description.filter(\.isLetter).count
+        return letterCount >= 2 && description.count <= 80
     }
 
     // MARK: - Amount helpers
