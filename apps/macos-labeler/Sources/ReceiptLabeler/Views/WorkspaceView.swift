@@ -9,7 +9,7 @@ struct WorkspaceView: View {
     var body: some View {
         NavigationSplitView {
             ImageGridView(controller: controller)
-                .navigationSplitViewColumnWidth(min: 320, ideal: 380, max: 520)
+                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
         } detail: {
             detailPane
         }

@@ -29,14 +29,15 @@ struct LabelingView: View {
     private func workspace(draft: LabelDraft) -> some View {
         HSplitView {
             ZoomableImageView(url: entry.imageURL)
-                .frame(minWidth: 360)
+                .frame(minWidth: 380, idealWidth: 720)
+                .layoutPriority(1)
             ReceiptFormSection(
                 draft: draft,
                 onSaveDraft: { save(draft: draft, as: .draft) },
                 onVerify:    { save(draft: draft, as: .verified) },
                 onReject:    { save(draft: draft, as: .rejected) }
             )
-            .frame(minWidth: 380)
+            .frame(minWidth: 300, idealWidth: 340, maxWidth: 460)
         }
     }
 

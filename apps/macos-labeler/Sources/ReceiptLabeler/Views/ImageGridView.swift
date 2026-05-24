@@ -1,7 +1,9 @@
 import SwiftUI
 
-/// Sidebar: scrollable list of dataset entries. Each row shows a thumbnail,
-/// the source filename, and a status pill. Selection drives the LabelingView.
+/// Sidebar: scrollable list of dataset entries. Each row shows a small
+/// thumbnail, the source filename, and a status pill. The top bar holds a
+/// single Menu dropdown for status filtering — replaces the row of chips
+/// which couldn't fit in a narrow sidebar.
 struct ImageGridView: View {
 
     @Bindable var controller: DatasetController
@@ -21,28 +23,50 @@ struct ImageGridView: View {
         }
     }
 
-    // MARK: - Filter
+    // MARK: - Filter bar
 
     private var filterBar: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                FilterChip(label: "All", count: controller.entries.count, isSelected: statusFilter == nil) {
+        HStack(spacing: 8) {
+            Menu {
+                Button {
                     statusFilter = nil
+                } label: {
+                    Label("All  (\(controller.entries.count))", systemImage: statusFilter == nil ? "checkmark" : "")
                 }
+                Divider()
                 ForEach(LabelStatus.allCases, id: \.self) { status in
-                    FilterChip(
-                        label: status.displayName,
-                        count: controller.entries.filter { $0.status == status }.count,
-                        isSelected: statusFilter == status
-                    ) {
-                        statusFilter = (statusFilter == status) ? nil : status
+                    Button {
+                        statusFilter = status
+                    } label: {
+                        let count = controller.entries.filter { $0.status == status }.count
+                        Label("\(status.displayName)  (\(count))", systemImage: statusFilter == status ? "checkmark" : "")
                     }
                 }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                    Text(activeFilterLabel)
+                        .lineLimit(1)
+                }
+                .font(.caption.weight(.medium))
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            Spacer(minLength: 4)
+
+            Text("\(filtered.count) / \(controller.entries.count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
         }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var activeFilterLabel: String {
+        statusFilter?.displayName ?? "All"
     }
 
     private var filtered: [DatasetEntry] {
@@ -72,19 +96,20 @@ private struct EntryRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Thumbnail(url: entry.imageURL)
-                .frame(width: 56, height: 56)
+                .frame(width: 44, height: 44)
                 .background(Color(nsColor: .quaternaryLabelColor))
-                .cornerRadius(4)
+                .cornerRadius(3)
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(entry.sourceFilename)
-                    .font(.system(.body, design: .monospaced))
+                    .font(.system(.callout, design: .monospaced))
                     .lineLimit(1)
                     .truncationMode(.middle)
                 StatusBadge(status: entry.status)
             }
-            Spacer()
+            Spacer(minLength: 0)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 1)
     }
 }
 
@@ -92,7 +117,7 @@ private struct Thumbnail: View {
     let url: URL
 
     var body: some View {
-        if let img = ImageLoader.shared.thumbnail(for: url, pixelSize: 56) {
+        if let img = ImageLoader.shared.thumbnail(for: url, pixelSize: 44) {
             Image(nsImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
@@ -108,9 +133,9 @@ private struct StatusBadge: View {
 
     var body: some View {
         Text(status.displayName)
-            .font(.caption2.weight(.medium))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
+            .font(.system(size: 9, weight: .semibold))
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
             .background(background)
             .foregroundStyle(foreground)
             .cornerRadius(3)
@@ -132,28 +157,5 @@ private struct StatusBadge: View {
         case .verified:  .green
         case .rejected:  .red
         }
-    }
-}
-
-// MARK: - Filter chip
-
-private struct FilterChip: View {
-    let label: String
-    let count: Int
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 4) {
-                Text(label).font(.caption.weight(.medium))
-                Text("\(count)").font(.caption2).foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(isSelected ? Color.accentColor.opacity(0.25) : Color.gray.opacity(0.12))
-            .cornerRadius(6)
-        }
-        .buttonStyle(.plain)
     }
 }
