@@ -71,16 +71,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             )
         }
 
-        // Feed the model the OCR lines WITH their Y coordinates so it can
-        // group descriptions and prices that landed on adjacent rows.
-        let spatialOCR = lines.enumerated().map { idx, line in
-            let yPct = Int((line.box.y * 100).rounded())
-            return String(format: "[L%02d y=%02d] %@", idx, yPct, line.text)
+        // Pre-cluster Vision observations into visual rows so a description
+        // and its price on the same printed line arrive at the model as a
+        // single row, separated by "  ". Massively reduces the
+        // pair-across-lines errors we'd otherwise see.
+        let rows = Self.clusterByRow(lines)
+        let spatialOCR = rows.enumerated().map { idx, row in
+            let yPct = Int((row.meanY * 100).rounded())
+            return String(format: "[R%02d y=%02d] %@", idx, yPct, row.joined)
         }.joined(separator: "\n")
 
         let session = LanguageModelSession(instructions: Self.instructions)
-        let prompt = "Receipt OCR (each line prefixed with [L## y=YY] where YY is vertical position 0=top..99=bottom). " +
-                     "When you see an item description followed by a price-only line at a similar y (within ~3), treat them as ONE line item.\n\n\(spatialOCR)\n\nReturn ONLY the JSON object."
+        let prompt = "Receipt OCR, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and are listed left-to-right; on a line-item row the rightmost segment is almost always the price.\n\n\(spatialOCR)\n\nReturn ONLY the JSON object."
 
         let rawResponse: String
         do {
@@ -121,7 +123,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     // MARK: - Instructions
 
     private static let instructions: String = """
-        You parse OCR text from receipts. The user supplies text that was recognized from a photo of a paper receipt, with each line prefixed by its line number and rough vertical position. \
+        You parse OCR text from receipts. The user supplies text that was recognized from a photo of a paper receipt, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is the row's vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and listed left-to-right. \
         Output ONLY a valid JSON object — no markdown, no commentary, no code fence.
 
         Strict shape (every key required, use empty string "" for fields not visible on the receipt):
@@ -143,9 +145,10 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         - All money fields are plain decimal strings like "12.34". No currency symbols, no thousands separators.
         - Currency is a 3-letter ISO 4217 code. Default to "USD" if unclear.
         - Date is strictly YYYY-MM-DD. If the receipt only shows a 2-digit year, assume 20YY.
-        - lineItems contains only purchased products in receipt order. Skip subtotal/tax/total/tip/discount/payment/change/cashback/loyalty/rewards lines.
-        - When a description on one line is followed by a price on the next line at a similar vertical position (Δy ≤ 3), combine them into ONE line item.
+        - lineItems contains only purchased products in receipt order. Do NOT include subtotal / tax / total / tip / discount / payment / change / balance due / card / credit / debit / cashback / loyalty / rewards / auth rows — those go in their dedicated fields above (or are dropped entirely).
+        - One row = at most one line item. On a line-item row, the rightmost segment is the price; segments before it form the description (and quantity if present).
         - When a quantity prefix appears ("2 ITEM", "2x ITEM", "QTY 2  ITEM"), set the quantity field separately and put just the item name in description.
+        - If a description-only row has no price and the row immediately below it is price-only at a nearby Y, treat that pair as ONE line item — but this should be rare after row grouping.
         - Use "" (empty string) for any field not visible. Do not guess merchant from filenames.
         - Do NOT wrap the JSON in markdown. Start your reply with { and end with }.
         """
@@ -181,6 +184,9 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let items: [Receipt.LineItem] = x.lineItems.compactMap { row in
             let desc = row.description.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !desc.isEmpty else { return nil }
+            // Defensive net: FM occasionally copies footer rows (CHANGE, CREDIT,
+            // BALANCE DUE, etc.) into lineItems despite the instructions.
+            guard !isFooterRow(desc) else { return nil }
             guard let price = parseDecimal(row.totalPrice) else { return nil }
             return Receipt.LineItem(
                 description: desc,
@@ -397,6 +403,102 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
         }
         return nil
+    }
+
+    // MARK: - Line-item footer denylist
+
+    /// Description prefixes that almost always indicate a payment/totals
+    /// footer row rather than a real purchased item. FM is told to skip
+    /// these in the prompt, but occasionally regresses — this is the safety
+    /// net. Matched case-insensitive, against the start of the description.
+    private static let lineItemFooterPrefixes: [String] = [
+        "balance", "balance due",
+        "credit", "credit card", "debit", "card", "visa", "mastercard", "mc ",
+        "amex", "american express", "discover",
+        "change", "cash", "tender", "tendered",
+        "subtotal", "sub total", "sub-total",
+        "tax", "sales tax", "vat", "gst", "hst",
+        "tip", "gratuity",
+        "total", "grand total", "amount due", "amount paid", "amount payable",
+        "auth", "approval", "approved", "ref ", "ref#", "ref:",
+        "payment", "paid",
+        "discount", "savings", "you saved", "coupon",
+        "cashback", "cash back",
+        "rounding",
+        "loyalty", "rewards", "points",
+        "invoice", "receipt", "transaction",
+    ]
+
+    private static func isFooterRow(_ description: String) -> Bool {
+        let lc = description.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !lc.isEmpty else { return true }
+        for prefix in lineItemFooterPrefixes {
+            if lc == prefix { return true }
+            // Require a word-boundary char after the prefix so "totalitarian"
+            // wouldn't match "total", and "creditor" wouldn't match "credit".
+            // (Hypothetical on receipts, but cheap insurance.)
+            if lc.hasPrefix(prefix + " ") { return true }
+            if lc.hasPrefix(prefix + ":") { return true }
+            if lc.hasPrefix(prefix + "\t") { return true }
+        }
+        return false
+    }
+
+    // MARK: - OCR row clustering
+
+    /// One visual row of the receipt, made up of one or more OCR
+    /// observations that share roughly the same Y. Segments are kept
+    /// left-to-right by X so prompt rows mirror printed receipt rows.
+    fileprivate struct OCRRow {
+        var segments: [(text: String, x: Double)]
+        var yMin: Double
+        var yMax: Double
+
+        var meanY: Double { (yMin + yMax) / 2 }
+
+        var joined: String {
+            segments
+                .sorted { $0.x < $1.x }
+                .map(\.text)
+                .joined(separator: "  ")
+        }
+    }
+
+    /// Group OCR observations into visual rows. Two observations belong to
+    /// the same row when they vertically overlap by at least ~40% of the
+    /// shorter one's height. This collapses the very common case where the
+    /// description and the price land on the same printed line but Vision
+    /// returns them as two separate observations — the exact case FM was
+    /// struggling to pair up using Y-percentage hints alone.
+    fileprivate static func clusterByRow(
+        _ lines: [(text: String, box: Receipt.BBox)]
+    ) -> [OCRRow] {
+        let sorted = lines.sorted {
+            ($0.box.y + $0.box.height / 2) < ($1.box.y + $1.box.height / 2)
+        }
+        var rows: [OCRRow] = []
+        for line in sorted {
+            let yTop = line.box.y
+            let yBot = line.box.y + line.box.height
+            let height = line.box.height
+            if var current = rows.last {
+                let overlap = min(yBot, current.yMax) - max(yTop, current.yMin)
+                let minH = min(height, current.yMax - current.yMin)
+                if minH > 0, overlap >= minH * 0.4 {
+                    current.segments.append((text: line.text, x: line.box.x))
+                    current.yMin = min(current.yMin, yTop)
+                    current.yMax = max(current.yMax, yBot)
+                    rows[rows.count - 1] = current
+                    continue
+                }
+            }
+            rows.append(OCRRow(
+                segments: [(text: line.text, x: line.box.x)],
+                yMin: yTop,
+                yMax: yBot
+            ))
+        }
+        return rows
     }
 
     private static func parseDecimal(_ s: String) -> Decimal? {

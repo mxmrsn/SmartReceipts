@@ -83,6 +83,26 @@ def find_image_path(image_id: str, source_filename: str | None = None) -> Path:
     )
 
 
+def iter_labeled(statuses: set[str] = {"verified"}) -> list[str]:
+    """Return imageIds of labels whose `_label.status` is in `statuses`.
+    Useful when you haven't generated train/val/test splits yet.
+    """
+    labels_dir = DATASET_DIR / "labels"
+    if not labels_dir.exists():
+        return []
+    out: list[str] = []
+    for f in sorted(labels_dir.glob("*.json")):
+        try:
+            import json
+            raw = json.loads(f.read_text())
+            status = raw.get("_label", {}).get("status")
+            if status in statuses:
+                out.append(f.stem)
+        except Exception:
+            continue
+    return out
+
+
 def load_label(image_id: str) -> LabeledSample:
     label_path = DATASET_DIR / "labels" / f"{image_id}.json"
     if not label_path.exists():

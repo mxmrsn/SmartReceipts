@@ -73,6 +73,15 @@ final class LabelDraft {
         self.lineItems = r.lineItems.map { LineItemDraft(from: $0) }
         self.status = document.label.status
         self.notes = document.label.notes ?? ""
+
+        // Migrate any per-line-item bboxes off provenance and onto the
+        // LineItemDraft itself, so deletes/reorders keep them in sync.
+        for (idx, item) in lineItems.enumerated() {
+            let key = String(format: "lineItem.%03d", idx)
+            if let box = r.provenance.bboxes[key] {
+                item.bbox = box
+            }
+        }
     }
 
     init(
@@ -107,6 +116,15 @@ final class LabelDraft {
         self.lineItems = receipt.lineItems.map { LineItemDraft(from: $0) }
         self.status = .draft
         self.notes = ""
+
+        // Same migration as the existing-label init: per-line-item bboxes
+        // ride on the LineItemDraft so deleting the item drops the box.
+        for (idx, item) in lineItems.enumerated() {
+            let key = String(format: "lineItem.%03d", idx)
+            if let box = receipt.provenance.bboxes[key] {
+                item.bbox = box
+            }
+        }
     }
 
     // MARK: - Derived
@@ -152,8 +170,33 @@ final class LabelDraft {
     /// Pipeline bboxes merged with user overrides. Overlay reads from here so
     /// the moment the user click-assigns a line to a field, the overlay
     /// reflects it.
+    ///
+    /// Line-item bboxes are NOT sourced from `basis.provenance.bboxes` —
+    /// they live on each `LineItemDraft`. We rebuild the `lineItem.NNN`
+    /// keys from the live array so that deleting an item removes its bbox
+    /// (and surviving items reindex to match their new positions).
     var effectiveBBoxes: [String: OCRKit.Receipt.BBox] {
-        basis.provenance.bboxes.merging(bboxOverrides) { _, override in override }
+        var result: [String: OCRKit.Receipt.BBox] = [:]
+        for (key, box) in basis.provenance.bboxes where !key.hasPrefix("lineItem.") {
+            result[key] = box
+        }
+        for (key, box) in bboxOverrides {
+            result[key] = box
+        }
+        for (idx, item) in lineItems.enumerated() {
+            if let box = item.bbox {
+                let key = String(format: "lineItem.%03d", idx)
+                result[key] = box
+            }
+        }
+        return result
+    }
+
+    /// Parse `"lineItem.NNN"` → `NNN`. Returns nil for non-line-item keys.
+    private static func parseLineItemIndex(_ key: String) -> Int? {
+        let prefix = "lineItem."
+        guard key.hasPrefix(prefix) else { return nil }
+        return Int(key.dropFirst(prefix.count))
     }
 
     enum FieldTarget: String, Sendable, CaseIterable {
@@ -190,52 +233,76 @@ final class LabelDraft {
     /// Move a bbox by a normalized delta. Used by drag gestures on the
     /// selected bbox; clamps so the box stays inside [0,1].
     func translateBBox(key: String, by delta: CGSize) {
+        if let idx = LabelDraft.parseLineItemIndex(key),
+           idx >= 0, idx < lineItems.count,
+           var box = lineItems[idx].bbox {
+            box.x = max(0, min(1 - box.width, box.x + Double(delta.width)))
+            box.y = max(0, min(1 - box.height, box.y + Double(delta.height)))
+            lineItems[idx].bbox = box
+            return
+        }
         guard var box = effectiveBBoxes[key] else { return }
-        let newX = max(0, min(1 - box.width, box.x + Double(delta.width)))
-        let newY = max(0, min(1 - box.height, box.y + Double(delta.height)))
-        box.x = newX
-        box.y = newY
+        box.x = max(0, min(1 - box.width, box.x + Double(delta.width)))
+        box.y = max(0, min(1 - box.height, box.y + Double(delta.height)))
         bboxOverrides[key] = box
     }
 
     /// Resize a bbox by dragging one of its corners. `corner` is 0=TL,
     /// 1=TR, 2=BL, 3=BR. Delta is in normalized image coordinates.
     func resizeBBox(key: String, corner: Int, by delta: CGSize) {
-        guard var box = effectiveBBoxes[key] else { return }
+        if let idx = LabelDraft.parseLineItemIndex(key),
+           idx >= 0, idx < lineItems.count,
+           let current = lineItems[idx].bbox,
+           let next = LabelDraft.applyCornerResize(box: current, corner: corner, delta: delta) {
+            lineItems[idx].bbox = next
+            return
+        }
+        guard let current = effectiveBBoxes[key],
+              let next = LabelDraft.applyCornerResize(box: current, corner: corner, delta: delta) else {
+            return
+        }
+        bboxOverrides[key] = next
+    }
+
+    /// Pure helper: given a bbox + a corner index + a normalized drag delta,
+    /// return the resized bbox, or nil if the move would produce an invalid
+    /// (too small / out-of-bounds) result.
+    private static func applyCornerResize(
+        box: OCRKit.Receipt.BBox,
+        corner: Int,
+        delta: CGSize
+    ) -> OCRKit.Receipt.BBox? {
+        var box = box
         let dx = Double(delta.width)
         let dy = Double(delta.height)
         switch corner {
-        case 0: // top-left: position grows, size shrinks
+        case 0: // top-left
             let newX = box.x + dx
             let newY = box.y + dy
             let newW = box.width - dx
             let newH = box.height - dy
-            if newW > 0.01, newH > 0.01, newX >= 0, newY >= 0 {
-                box.x = newX; box.y = newY; box.width = newW; box.height = newH
-            }
-        case 1: // top-right: y grows, height shrinks, width grows
+            guard newW > 0.01, newH > 0.01, newX >= 0, newY >= 0 else { return nil }
+            box.x = newX; box.y = newY; box.width = newW; box.height = newH
+        case 1: // top-right
             let newY = box.y + dy
             let newW = box.width + dx
             let newH = box.height - dy
-            if newW > 0.01, newH > 0.01, newY >= 0, box.x + newW <= 1 {
-                box.y = newY; box.width = newW; box.height = newH
-            }
-        case 2: // bottom-left: x grows, width shrinks, height grows
+            guard newW > 0.01, newH > 0.01, newY >= 0, box.x + newW <= 1 else { return nil }
+            box.y = newY; box.width = newW; box.height = newH
+        case 2: // bottom-left
             let newX = box.x + dx
             let newW = box.width - dx
             let newH = box.height + dy
-            if newW > 0.01, newH > 0.01, newX >= 0, box.y + newH <= 1 {
-                box.x = newX; box.width = newW; box.height = newH
-            }
-        case 3: // bottom-right: width + height grow
+            guard newW > 0.01, newH > 0.01, newX >= 0, box.y + newH <= 1 else { return nil }
+            box.x = newX; box.width = newW; box.height = newH
+        case 3: // bottom-right
             let newW = box.width + dx
             let newH = box.height + dy
-            if newW > 0.01, newH > 0.01, box.x + newW <= 1, box.y + newH <= 1 {
-                box.width = newW; box.height = newH
-            }
-        default: return
+            guard newW > 0.01, newH > 0.01, box.x + newW <= 1, box.y + newH <= 1 else { return nil }
+            box.width = newW; box.height = newH
+        default: return nil
         }
-        bboxOverrides[key] = box
+        return box
     }
 
     /// Assign an OCR line's text + bbox to a field. The form value updates
@@ -260,7 +327,7 @@ final class LabelDraft {
             bboxOverrides["totals.subtotal"] = line.box
         case .lineItem:
             // Best-effort: extract description + price from one line, append
-            // as a new line item.
+            // as a new line item with its bbox riding on the draft itself.
             let (desc, price) = LabelDraft.splitDescriptionAndPrice(line.text)
             let item = LineItemDraft(from: OCRKit.Receipt.LineItem(
                 description: desc,
@@ -269,10 +336,8 @@ final class LabelDraft {
                 totalPrice: price ?? 0,
                 category: nil
             ))
+            item.bbox = line.box
             lineItems.append(item)
-            // Index it under lineItem.NNN
-            let idx = lineItems.count - 1
-            bboxOverrides["lineItem.\(String(format: "%03d", idx))"] = line.box
         }
     }
 
@@ -374,6 +439,11 @@ final class LineItemDraft: Identifiable {
     var unitPrice: Decimal?
     var totalPrice: Decimal
     var category: OCRKit.Receipt.Category?
+    /// Bbox attached to this specific line item. Lives with the LineItemDraft
+    /// (rather than in a separate `lineItem.NNN`-keyed dictionary) so that
+    /// deleting the item also drops its bbox, and reordering re-keys
+    /// automatically.
+    var bbox: OCRKit.Receipt.BBox?
 
     init(from item: OCRKit.Receipt.LineItem) {
         self.itemDescription = item.description
@@ -381,6 +451,7 @@ final class LineItemDraft: Identifiable {
         self.unitPrice = item.unitPrice
         self.totalPrice = item.totalPrice
         self.category = item.category
+        self.bbox = nil
     }
 
     init(blank: ()) {
@@ -389,6 +460,7 @@ final class LineItemDraft: Identifiable {
         self.unitPrice = nil
         self.totalPrice = 0
         self.category = nil
+        self.bbox = nil
     }
 
     var asCanonical: OCRKit.Receipt.LineItem {

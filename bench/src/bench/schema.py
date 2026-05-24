@@ -133,6 +133,16 @@ class Receipt(BaseModel):
     provenance: Provenance
 
 
+class OCRLine(BaseModel):
+    """One text observation from Vision, with its bbox."""
+
+    model_config = _MODEL_CONFIG
+
+    id: str
+    text: str
+    box: BBox
+
+
 class ExtractionResult(BaseModel):
     """Output of any pipeline run via `tools/ocr-cli`."""
 
@@ -142,3 +152,4 @@ class ExtractionResult(BaseModel):
     latencyMs: int
     peakMemoryMB: Optional[int] = None
     rawText: Optional[str] = None
+    ocrLines: list[OCRLine] = Field(default_factory=list)
