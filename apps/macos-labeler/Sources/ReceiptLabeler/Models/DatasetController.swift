@@ -74,9 +74,10 @@ final class DatasetController {
 
     // MARK: - Pre-labeling
 
-    /// Run the registered baseline pipeline (VisionOnlyPipeline) over the
-    /// selected entry's image and stash the result as a `pendingDraft` for
-    /// the form to merge in.
+    /// Run the best available pipeline over the selected entry's image and
+    /// stash the result for the form to merge in. If the preferred pipeline
+    /// (Foundation Models when Apple Intelligence is enabled) fails, fall
+    /// back to the Vision+regex baseline so the user is never stuck.
     func runPreLabel(for entry: DatasetEntry) async {
         guard !isExtracting else { return }
         isExtracting = true
@@ -89,21 +90,40 @@ final class DatasetController {
             return
         }
 
+        let preferred = OCRPipelineRegistry.preferred
+        let fallback = VisionOnlyPipeline()
+
         do {
-            let pipeline = VisionOnlyPipeline()
-            let result = try await pipeline.extract(image: cgImage)
-            var canonical = result.receipt
-            canonical.imageId = entry.imageId  // anchor to the dataset-stable id
-            pendingExtraction = OCRKit.ExtractionResult(
-                receipt: canonical,
-                latencyMs: result.latencyMs,
-                peakMemoryMB: result.peakMemoryMB,
-                rawText: result.rawText
-            )
-            statusMessage = "Pre-label generated for \(entry.sourceFilename) in \(result.latencyMs) ms"
+            let result = try await preferred.extract(image: cgImage)
+            stashResult(result, for: entry, pipelineDisplayName: type(of: preferred).displayName)
+            return
         } catch {
-            statusMessage = "Pre-label failed: \(error.localizedDescription)"
+            // If preferred IS the fallback, no point retrying.
+            if type(of: preferred).id == VisionOnlyPipeline.id {
+                statusMessage = "Pre-label failed: \(error.localizedDescription)"
+                return
+            }
+            // Try the fallback. Tell the user we degraded.
+            statusMessage = "\(type(of: preferred).displayName) unavailable (\(error.localizedDescription)) — falling back…"
+            do {
+                let result = try await fallback.extract(image: cgImage)
+                stashResult(result, for: entry, pipelineDisplayName: "\(VisionOnlyPipeline.displayName) (fallback)")
+            } catch {
+                statusMessage = "Both pipelines failed: \(error.localizedDescription)"
+            }
         }
+    }
+
+    private func stashResult(_ result: OCRKit.ExtractionResult, for entry: DatasetEntry, pipelineDisplayName: String) {
+        var canonical = result.receipt
+        canonical.imageId = entry.imageId  // anchor to the dataset-stable id
+        pendingExtraction = OCRKit.ExtractionResult(
+            receipt: canonical,
+            latencyMs: result.latencyMs,
+            peakMemoryMB: result.peakMemoryMB,
+            rawText: result.rawText
+        )
+        statusMessage = "Pre-label by \(pipelineDisplayName) — \(result.latencyMs) ms · \(entry.sourceFilename)"
     }
 
     // MARK: - Saving

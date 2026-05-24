@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "ReceiptLabeler",
     platforms: [
-        .macOS(.v14)
+        .macOS("26.0")
     ],
     dependencies: [
         .package(path: "../../packages/OCRKit")

@@ -8,9 +8,12 @@ import PackageDescription
 // re-adding the testTarget below after running `sudo xcode-select -s /Applications/Xcode.app`.
 let package = Package(
     name: "OCRKit",
+    // macOS 26 / iOS 26 minimum to access the FoundationModels framework.
+    // Both consumers (the iOS app and the macOS labeler) already target
+    // iOS 26 / macOS 26 so this isn't a regression.
     platforms: [
-        .iOS(.v17),
-        .macOS(.v14)
+        .iOS("26.0"),
+        .macOS("26.0")
     ],
     products: [
         .library(name: "OCRKit", targets: ["OCRKit"])
