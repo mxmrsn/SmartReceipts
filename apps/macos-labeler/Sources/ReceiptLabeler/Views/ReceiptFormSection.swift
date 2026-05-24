@@ -20,26 +20,26 @@ struct ReceiptFormSection: View {
     @State private var showRawOCR: Bool = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            if draft.isPreLabel {
-                PreLabelBanner(pipelineId: draft.pipelineId)
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    headerSection
-                    if let rawText = draft.rawText, !rawText.isEmpty {
-                        rawOCRSection(rawText)
-                    }
-                    lineItemsSection
-                    notesSection
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if draft.isPreLabel {
+                    PreLabelBanner(pipelineId: draft.pipelineId)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 14)
+                headerSection
+                if let rawText = draft.rawText, !rawText.isEmpty {
+                    rawOCRSection(rawText)
+                }
+                lineItemsSection
+                notesSection
             }
-
-            Divider()
-            actionBar
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                actionBar
+            }
         }
     }
 
@@ -183,24 +183,25 @@ private struct PreLabelBanner: View {
     let pipelineId: String
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        HStack(spacing: 8) {
             Image(systemName: "sparkles")
                 .foregroundStyle(.tint)
-                .font(.title3)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Auto-detected by \(pipelineId)")
-                    .font(.subheadline.weight(.semibold))
-                Text("Review fields below. “Auto” = untouched, “Edited” = your changes. ⌘⏎ Verify · ⇧⌘S Save Draft.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text("Auto-detected by ")
+                .foregroundStyle(.secondary)
+            + Text(pipelineId)
+                .font(.callout.weight(.semibold))
             Spacer()
+            Text("review and modify")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .font(.callout)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.accentColor.opacity(0.10))
+        .cornerRadius(6)
+        .help("Each header field shows an Auto / Edited pill. ⌘⏎ to Verify · ⇧⌘S to Save Draft.")
     }
 }
 

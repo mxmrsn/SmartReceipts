@@ -17,44 +17,46 @@ struct ZoomableImageView: View {
     private let maxZoom: CGFloat = 4.0
 
     var body: some View {
-        VStack(spacing: 0) {
-            GeometryReader { geo in
-                ScrollView([.horizontal, .vertical]) {
-                    if let image {
-                        Image(nsImage: image)
-                            .resizable()
-                            .interpolation(.medium)
-                            .frame(
-                                width: image.size.width * zoom,
-                                height: image.size.height * zoom
-                            )
-                            .padding(16)
-                            .frame(
-                                minWidth: geo.size.width,
-                                minHeight: geo.size.height,
-                                alignment: .center
-                            )
-                    } else {
-                        ProgressView()
-                            .frame(
-                                minWidth: geo.size.width,
-                                minHeight: geo.size.height
-                            )
-                    }
-                }
-                .background(Color(nsColor: .controlBackgroundColor))
-                .task(id: url) {
-                    image = ImageLoader.shared.fullImage(for: url)
-                    containerSize = geo.size
-                    recomputeFit(initial: true)
-                }
-                .onChange(of: geo.size) { _, newSize in
-                    containerSize = newSize
-                    recomputeFit(initial: false)
+        GeometryReader { geo in
+            ScrollView([.horizontal, .vertical]) {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.medium)
+                        .frame(
+                            width: image.size.width * zoom,
+                            height: image.size.height * zoom
+                        )
+                        .padding(16)
+                        .frame(
+                            minWidth: geo.size.width,
+                            minHeight: geo.size.height,
+                            alignment: .center
+                        )
+                } else {
+                    ProgressView()
+                        .frame(
+                            minWidth: geo.size.width,
+                            minHeight: geo.size.height
+                        )
                 }
             }
-            Divider()
-            controlBar
+            .background(Color(nsColor: .controlBackgroundColor))
+            .task(id: url) {
+                image = ImageLoader.shared.fullImage(for: url)
+                containerSize = geo.size
+                recomputeFit(initial: true)
+            }
+            .onChange(of: geo.size) { _, newSize in
+                containerSize = newSize
+                recomputeFit(initial: false)
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                controlBar
+            }
         }
     }
 

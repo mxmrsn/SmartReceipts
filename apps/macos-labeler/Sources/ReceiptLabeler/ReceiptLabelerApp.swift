@@ -12,9 +12,10 @@ struct ReceiptLabelerApp: App {
     var body: some Scene {
         WindowGroup {
             WorkspaceView(controller: controller)
-                .frame(minWidth: 1000, minHeight: 640)
+                .frame(minWidth: 1100, minHeight: 700)
         }
-        .windowResizability(.contentSize)
+        .defaultSize(width: 1500, height: 950)
+        .windowResizability(.contentMinSize)
     }
 
     /// Default to `<repo>/dataset/` as detected from the binary's location.
