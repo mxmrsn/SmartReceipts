@@ -12,7 +12,7 @@ import Vision
 public struct VisionOnlyPipeline: OCRPipeline {
     public static let id = "vision-regex"
     public static let displayName = "Apple Vision + Regex"
-    public static let modelVersion = "vision-accurate.1"
+    public static let modelVersion = "vision-accurate.2"
 
     public init() {}
 
@@ -32,10 +32,14 @@ public struct VisionOnlyPipeline: OCRPipeline {
         }
 
         let observations: [VNRecognizedTextObservation] = request.results ?? []
-        let lines: [(text: String, box: Receipt.BBox)] = observations.compactMap { obs in
-            guard let top = obs.topCandidates(1).first else { return nil }
-            return (text: top.string, box: Self.bbox(from: obs.boundingBox))
-        }
+        // Sort top-to-bottom so the rawText shown to the user matches the
+        // reading order the parser sees.
+        let lines: [(text: String, box: Receipt.BBox)] = observations
+            .compactMap { obs -> (text: String, box: Receipt.BBox)? in
+                guard let top = obs.topCandidates(1).first else { return nil }
+                return (text: top.string, box: Self.bbox(from: obs.boundingBox))
+            }
+            .sorted { $0.box.y < $1.box.y }
         let rawText = lines.map(\.text).joined(separator: "\n")
 
         let parsed = ReceiptHeuristicParser.parse(lines: lines)
