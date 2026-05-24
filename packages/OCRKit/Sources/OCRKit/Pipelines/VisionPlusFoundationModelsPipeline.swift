@@ -84,9 +84,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let session = LanguageModelSession(instructions: Self.instructions)
         let prompt = "Receipt OCR, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and are listed left-to-right; on a line-item row the rightmost segment is almost always the price.\n\n\(spatialOCR)\n\nReturn ONLY the JSON object."
 
+        // Receipts with 20+ line items routinely overflowed the default budget
+        // and the model truncated mid-array, breaking JSON parsing. 4096 tokens
+        // comfortably fits a 40-item receipt as compact JSON.
+        let options = GenerationOptions(
+            sampling: .greedy,
+            temperature: 0.0,
+            maximumResponseTokens: 4096
+        )
+
         let rawResponse: String
         do {
-            let response = try await session.respond(to: prompt)
+            let response = try await session.respond(to: prompt, options: options)
             rawResponse = response.content
         } catch {
             throw OCRError.parseFailed(

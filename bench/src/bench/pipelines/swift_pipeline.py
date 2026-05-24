@@ -65,7 +65,35 @@ class SwiftPipelineAdapter(PipelineAdapter):
                 f"ocr-cli failed for pipeline={self.id} image={image_path}:\n"
                 f"stdout: {result.stdout}\nstderr: {result.stderr}"
             )
-        payload = json.loads(result.stdout)
+        # Apple frameworks (Vision, CoreML) occasionally print warnings like
+        # "too few samples" to stdout. Slice from the first '{' so envelope
+        # parsing is robust to that noise.
+        payload = _extract_envelope(result.stdout, pipeline_id=self.id, image_path=image_path)
         if not payload.get("ok"):
             raise RuntimeError(f"ocr-cli reported failure: {payload.get('error')}")
         return ExtractionResult.model_validate(payload["result"])
+
+
+def _extract_envelope(stdout: str, pipeline_id: str, image_path: Path) -> dict:
+    """Locate and parse the JSON envelope in ocr-cli stdout.
+
+    Tolerates leading framework-warning noise (e.g. Vision/CoreML printing
+    "too few samples" to stdout) by slicing from the first '{' to the last
+    '}'. Falls back to a clear error if no JSON object is found.
+    """
+    start = stdout.find("{")
+    end = stdout.rfind("}")
+    if start < 0 or end < 0 or end < start:
+        snippet = stdout[:500] if stdout else "(empty stdout)"
+        raise RuntimeError(
+            f"ocr-cli for pipeline={pipeline_id} image={image_path} "
+            f"produced no JSON envelope. stdout starts with: {snippet!r}"
+        )
+    body = stdout[start : end + 1]
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"ocr-cli envelope for pipeline={pipeline_id} image={image_path} "
+            f"is not valid JSON ({e}). Body snippet: {body[:500]!r}"
+        ) from e
