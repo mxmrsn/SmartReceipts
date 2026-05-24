@@ -7,35 +7,41 @@ struct WorkspaceView: View {
     @Bindable var controller: DatasetController
 
     var body: some View {
-        NavigationSplitView {
-            ImageGridView(controller: controller)
-                .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
-        } detail: {
-            detailPane
-        }
-        .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    pickDatasetDirectory()
-                } label: {
-                    Label("Open folder…", systemImage: "folder")
+        // StatusBar is a sibling of NavigationSplitView (not a safeAreaInset)
+        // so the split view's height excludes the status strip. Without this
+        // the form's inner .safeAreaInset(edge: .bottom) for the action bar
+        // lands at the same y-coordinate as the StatusBar and they overlap.
+        VStack(spacing: 0) {
+            NavigationSplitView {
+                ImageGridView(controller: controller)
+                    .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 380)
+            } detail: {
+                detailPane
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        pickDatasetDirectory()
+                    } label: {
+                        Label("Open folder…", systemImage: "folder")
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        controller.reload()
+                    } label: {
+                        Label("Reload", systemImage: "arrow.clockwise")
+                    }
+                    .keyboardShortcut("r", modifiers: [.command])
                 }
             }
-            ToolbarItem(placement: .primaryAction) {
-                Button {
-                    controller.reload()
-                } label: {
-                    Label("Reload", systemImage: "arrow.clockwise")
-                }
-                .keyboardShortcut("r", modifiers: [.command])
-            }
-        }
-        .safeAreaInset(edge: .bottom) {
+            .navigationTitle("Receipt Labeler")
+            .navigationSubtitle(controller.datasetDirectory.lastPathComponent)
+            .onAppear { controller.reload() }
+
+            Divider()
             StatusBar(message: controller.statusMessage, isBusy: controller.isExtracting)
         }
-        .navigationTitle("Receipt Labeler")
-        .navigationSubtitle(controller.datasetDirectory.lastPathComponent)
-        .onAppear { controller.reload() }
     }
 
     @ViewBuilder
