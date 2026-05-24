@@ -339,7 +339,9 @@ Smart Receipts/
 ├── apps/
 │   ├── ios/                            # Existing Xcode project moved here
 │   │   └── Smart Receipts.xcodeproj
-│   └── macos-labeler/                  # New Xcode project (M3)
+│   └── macos-labeler/                  # SwiftPM executable (Package.swift, M3)
+│       ├── Package.swift
+│       └── Sources/ReceiptLabeler/
 ├── packages/
 │   └── OCRKit/                         # Swift Package
 │       ├── Package.swift

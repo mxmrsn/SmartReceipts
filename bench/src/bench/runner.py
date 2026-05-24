@@ -9,7 +9,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from bench.dataset import DATASET_DIR, load_label, load_split
+from bench.dataset import DATASET_DIR, SUPPORTED_IMAGE_EXTS, iter_image_paths, load_label, load_split
 from bench.pipelines.swift_pipeline import SwiftPipelineAdapter, list_pipelines
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -44,10 +44,15 @@ def stats() -> None:
     for split in ("train", "val", "test"):
         ids = load_split(split)
         table.add_row(split, str(len(ids)))
-    image_count = sum(1 for _ in (DATASET_DIR / "images").glob("*.*") if _.suffix.lower() in (".jpg", ".png"))
+    images = iter_image_paths()
+    by_ext: dict[str, int] = {}
+    for p in images:
+        by_ext[p.suffix.lower()] = by_ext.get(p.suffix.lower(), 0) + 1
     label_count = sum(1 for _ in (DATASET_DIR / "labels").glob("*.json"))
     console.print(table)
-    console.print(f"[bold]images/[/bold] on disk: {image_count}")
+    parts = [f"{ext}: {n}" for ext, n in sorted(by_ext.items())]
+    detail = f"  ({', '.join(parts)})" if parts else ""
+    console.print(f"[bold]images/[/bold] on disk: {len(images)}{detail}")
     console.print(f"[bold]labels/[/bold] on disk: {label_count}")
 
 
