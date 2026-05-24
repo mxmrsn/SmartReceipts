@@ -61,11 +61,11 @@ struct ZoomableImageView: View {
     // MARK: - Controls
 
     private var controlBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 12) {
             Button { adjustZoom(by: 1 / 1.25) } label: {
                 Image(systemName: "minus.magnifyingglass")
             }
-            .help("Zoom out (⌘-)")
+            .help("Zoom out (⌘−)")
             .keyboardShortcut("-", modifiers: [.command])
 
             Button { adjustZoom(by: 1.25) } label: {
@@ -75,28 +75,28 @@ struct ZoomableImageView: View {
             .keyboardShortcut("=", modifiers: [.command])
 
             Slider(value: $zoom, in: minZoom...maxZoom)
-                .frame(width: 160)
+                .frame(minWidth: 120, idealWidth: 180, maxWidth: 240)
 
             Button("Fit") {
                 recomputeFit(initial: false)
                 zoom = fitZoom
             }
-            .help("Fit to window (⌘0)")
+            .help("Fit window (⌘0)")
             .keyboardShortcut("0", modifiers: [.command])
 
             Button("100%") { zoom = 1.0 }
                 .help("Actual size (⌘1)")
                 .keyboardShortcut("1", modifiers: [.command])
 
-            Spacer()
+            Spacer(minLength: 8)
 
             Text("\(Int((zoom * 100).rounded()))%")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 56, alignment: .trailing)
+                .frame(minWidth: 48, alignment: .trailing)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .background(.bar)
     }
 
@@ -121,7 +121,10 @@ struct ZoomableImageView: View {
         )
         let scaleW = avail.width / image.size.width
         let scaleH = avail.height / image.size.height
-        fitZoom = max(minZoom, min(scaleW, scaleH))
+        // Fill the larger axis: portrait receipts fill the pane width and
+        // scroll vertically; landscape ones fill height. Cap at 1.0 so we
+        // never enlarge past native resolution.
+        fitZoom = max(minZoom, min(max(scaleW, scaleH), 1.0))
         if initial {
             zoom = fitZoom
         }

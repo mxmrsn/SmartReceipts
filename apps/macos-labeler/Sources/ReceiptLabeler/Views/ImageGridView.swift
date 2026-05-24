@@ -24,22 +24,24 @@ struct ImageGridView: View {
     // MARK: - Filter
 
     private var filterBar: some View {
-        HStack(spacing: 8) {
-            FilterChip(label: "All", count: controller.entries.count, isSelected: statusFilter == nil) {
-                statusFilter = nil
-            }
-            ForEach(LabelStatus.allCases, id: \.self) { status in
-                FilterChip(
-                    label: status.displayName,
-                    count: controller.entries.filter { $0.status == status }.count,
-                    isSelected: statusFilter == status
-                ) {
-                    statusFilter = (statusFilter == status) ? nil : status
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                FilterChip(label: "All", count: controller.entries.count, isSelected: statusFilter == nil) {
+                    statusFilter = nil
+                }
+                ForEach(LabelStatus.allCases, id: \.self) { status in
+                    FilterChip(
+                        label: status.displayName,
+                        count: controller.entries.filter { $0.status == status }.count,
+                        isSelected: statusFilter == status
+                    ) {
+                        statusFilter = (statusFilter == status) ? nil : status
+                    }
                 }
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
