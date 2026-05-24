@@ -186,6 +186,46 @@ final class LabelDraft {
         bboxOverrides[key] = box
     }
 
+    /// Resize a bbox by dragging one of its corners. `corner` is 0=TL,
+    /// 1=TR, 2=BL, 3=BR. Delta is in normalized image coordinates.
+    func resizeBBox(key: String, corner: Int, by delta: CGSize) {
+        guard var box = effectiveBBoxes[key] else { return }
+        let dx = Double(delta.width)
+        let dy = Double(delta.height)
+        switch corner {
+        case 0: // top-left: position grows, size shrinks
+            let newX = box.x + dx
+            let newY = box.y + dy
+            let newW = box.width - dx
+            let newH = box.height - dy
+            if newW > 0.01, newH > 0.01, newX >= 0, newY >= 0 {
+                box.x = newX; box.y = newY; box.width = newW; box.height = newH
+            }
+        case 1: // top-right: y grows, height shrinks, width grows
+            let newY = box.y + dy
+            let newW = box.width + dx
+            let newH = box.height - dy
+            if newW > 0.01, newH > 0.01, newY >= 0, box.x + newW <= 1 {
+                box.y = newY; box.width = newW; box.height = newH
+            }
+        case 2: // bottom-left: x grows, width shrinks, height grows
+            let newX = box.x + dx
+            let newW = box.width - dx
+            let newH = box.height + dy
+            if newW > 0.01, newH > 0.01, newX >= 0, box.y + newH <= 1 {
+                box.x = newX; box.width = newW; box.height = newH
+            }
+        case 3: // bottom-right: width + height grow
+            let newW = box.width + dx
+            let newH = box.height + dy
+            if newW > 0.01, newH > 0.01, box.x + newW <= 1, box.y + newH <= 1 {
+                box.width = newW; box.height = newH
+            }
+        default: return
+        }
+        bboxOverrides[key] = box
+    }
+
     /// Assign an OCR line's text + bbox to a field. The form value updates
     /// immediately and the bbox override is recorded so the overlay highlight
     /// jumps to the clicked line.

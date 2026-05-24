@@ -7,16 +7,13 @@ import SwiftUI
 ///    open a popover to assign it to a field, OR if a field is currently
 ///    selected, click to assign directly without the popover.
 /// 2. **Claimed fields** rendered as solid colored rectangles. The one
-///    matching `draft.selectedBBoxKey` gets a highlighted ring and a
-///    drag-gesture handler — drag it to move the bbox to a new location.
+///    matching `draft.selectedBBoxKey` gets a highlighted ring, four
+///    corner resize handles, and a drag-to-move handler.
 struct BoundingBoxOverlay: View {
 
     @Bindable var draft: LabelDraft
 
     var body: some View {
-        // GeometryReader inside an `.overlay()` of an Image reports the
-        // image's actual display size — required for normalized coords to
-        // map cleanly onto the visible image.
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 // Layer 1: all OCR lines as faint click-targets
@@ -44,8 +41,11 @@ struct BoundingBoxOverlay: View {
                         canvasSize: geo.size,
                         isSelected: item.bboxKey == draft.selectedBBoxKey,
                         onSelect: { draft.selectedBBoxKey = item.bboxKey },
-                        onDragEnd: { delta in
+                        onMoveEnd: { delta in
                             draft.translateBBox(key: item.bboxKey, by: delta)
+                        },
+                        onResizeEnd: { corner, delta in
+                            draft.resizeBBox(key: item.bboxKey, corner: corner, by: delta)
                         }
                     )
                 }
@@ -87,42 +87,37 @@ struct BoundingBoxOverlay: View {
     }
 }
 
-// MARK: - Claimed-box view with selection + drag
+// MARK: - Claimed-box view with selection, move, and corner-resize
 
 private struct ClaimedBoxView: View {
     let item: BoundingBoxOverlay.ClaimedItem
     let canvasSize: CGSize
     let isSelected: Bool
     let onSelect: () -> Void
-    let onDragEnd: (CGSize) -> Void
+    /// Commit a move (translation) on drag-end. Delta is in normalized
+    /// image coordinates.
+    let onMoveEnd: (CGSize) -> Void
+    /// Commit a corner-resize on drag-end. 0=TL, 1=TR, 2=BL, 3=BR.
+    let onResizeEnd: (Int, CGSize) -> Void
 
     @State private var dragOffset: CGSize = .zero
+    /// Which corner is being resized (nil = none, the whole body is the
+    /// drag target for translate).
+    @State private var resizingCorner: Int? = nil
+    @State private var resizeOffset: CGSize = .zero
 
     var body: some View {
-        let rect = CGRect(
-            x: item.bbox.x * canvasSize.width,
-            y: item.bbox.y * canvasSize.height,
-            width: item.bbox.width * canvasSize.width,
-            height: item.bbox.height * canvasSize.height
-        )
+        let rect = liveRect()
 
         ZStack(alignment: .topLeading) {
             Rectangle()
                 .stroke(item.color, lineWidth: isSelected ? 3 : 2)
                 .background(item.color.opacity(isSelected ? 0.18 : 0.10))
                 .frame(width: rect.width, height: rect.height)
-            // Corner pips on the selected box give it a "draggable handle" feel.
-            if isSelected {
-                ForEach(0..<4, id: \.self) { corner in
-                    Circle()
-                        .fill(item.color)
-                        .frame(width: 8, height: 8)
-                        .offset(
-                            x: corner % 2 == 0 ? -4 : (rect.width - 4),
-                            y: corner < 2 ? -4 : (rect.height - 4)
-                        )
-                }
-            }
+                // Body drag handles translation. Auto-selects on first
+                // drag so users don't need to click-then-drag.
+                .gesture(translateGesture)
+
             Text(item.label)
                 .font(.system(size: 9, weight: .semibold))
                 .padding(.horizontal, 4)
@@ -131,36 +126,109 @@ private struct ClaimedBoxView: View {
                 .foregroundStyle(.white)
                 .cornerRadius(2)
                 .offset(x: 0, y: -14)
+                .allowsHitTesting(false)
+
+            if isSelected {
+                ForEach(0..<4, id: \.self) { corner in
+                    cornerHandle(corner: corner, in: rect)
+                }
+            }
         }
-        .offset(x: rect.minX + dragOffset.width, y: rect.minY + dragOffset.height)
-        .contentShape(Rectangle())
-        // Tap selects; drag (only when already selected) moves. exclusively
-        // ensures a stationary click never accidentally triggers a drag and
-        // a real drag never falsely fires as a tap.
-        .gesture(
-            TapGesture()
-                .onEnded { _ in onSelect() }
-                .exclusively(before:
-                    DragGesture(minimumDistance: 4)
-                        .onChanged { value in
-                            guard isSelected else { return }
-                            dragOffset = value.translation
-                        }
-                        .onEnded { value in
-                            guard isSelected else {
-                                dragOffset = .zero
-                                return
-                            }
-                            let normalized = CGSize(
-                                width: value.translation.width / canvasSize.width,
-                                height: value.translation.height / canvasSize.height
-                            )
-                            onDragEnd(normalized)
-                            dragOffset = .zero
-                        }
+        .offset(x: rect.minX, y: rect.minY)
+        .help("\(item.label) — drag the body to move, drag a corner to resize")
+    }
+
+    // MARK: - Live rect (applies the in-flight drag/resize visually)
+
+    private func liveRect() -> CGRect {
+        let baseX = item.bbox.x * canvasSize.width
+        let baseY = item.bbox.y * canvasSize.height
+        let baseW = item.bbox.width * canvasSize.width
+        let baseH = item.bbox.height * canvasSize.height
+
+        // Apply translate
+        var x = baseX + dragOffset.width
+        var y = baseY + dragOffset.height
+        var w = baseW
+        var h = baseH
+
+        // Apply resize for whichever corner is active
+        if let corner = resizingCorner {
+            let dx = resizeOffset.width
+            let dy = resizeOffset.height
+            switch corner {
+            case 0:  // TL
+                x = baseX + dx;  y = baseY + dy
+                w = max(8, baseW - dx);  h = max(8, baseH - dy)
+            case 1:  // TR
+                y = baseY + dy
+                w = max(8, baseW + dx);  h = max(8, baseH - dy)
+            case 2:  // BL
+                x = baseX + dx
+                w = max(8, baseW - dx);  h = max(8, baseH + dy)
+            case 3:  // BR
+                w = max(8, baseW + dx);  h = max(8, baseH + dy)
+            default: break
+            }
+        }
+        return CGRect(x: x, y: y, width: w, height: h)
+    }
+
+    // MARK: - Body translate gesture
+
+    private var translateGesture: some Gesture {
+        DragGesture(minimumDistance: 3)
+            .onChanged { value in
+                // Auto-select on drag start so first move always works
+                if !isSelected { onSelect() }
+                dragOffset = value.translation
+            }
+            .onEnded { value in
+                if !isSelected { onSelect() }
+                let normalized = CGSize(
+                    width: value.translation.width / canvasSize.width,
+                    height: value.translation.height / canvasSize.height
                 )
-        )
-        .help("\(item.label): tap to select, drag to move")
+                onMoveEnd(normalized)
+                dragOffset = .zero
+            }
+    }
+
+    // MARK: - Corner handle
+
+    @ViewBuilder
+    private func cornerHandle(corner: Int, in rect: CGRect) -> some View {
+        let pos: CGPoint = {
+            switch corner {
+            case 0: return CGPoint(x: 0, y: 0)
+            case 1: return CGPoint(x: rect.width, y: 0)
+            case 2: return CGPoint(x: 0, y: rect.height)
+            case 3: return CGPoint(x: rect.width, y: rect.height)
+            default: return .zero
+            }
+        }()
+        Circle()
+            .fill(item.color)
+            .overlay(Circle().stroke(Color.white, lineWidth: 1.5))
+            .frame(width: 14, height: 14)
+            .offset(x: pos.x - 7, y: pos.y - 7)
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        resizingCorner = corner
+                        resizeOffset = value.translation
+                    }
+                    .onEnded { value in
+                        let normalized = CGSize(
+                            width: value.translation.width / canvasSize.width,
+                            height: value.translation.height / canvasSize.height
+                        )
+                        onResizeEnd(corner, normalized)
+                        resizingCorner = nil
+                        resizeOffset = .zero
+                    }
+            )
+            .help("Drag to resize")
     }
 }
 
@@ -196,7 +264,6 @@ private struct OCRLineButton: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture {
-            // If a field is selected, single-click assigns directly. Else show menu.
             if selectedKey != nil {
                 onAssignToSelected()
             } else {

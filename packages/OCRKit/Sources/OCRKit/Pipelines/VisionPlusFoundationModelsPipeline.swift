@@ -264,10 +264,19 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         if let box = locateBBox(value: receipt.header.merchant.name, in: lines) {
             bboxes["merchant.name"] = box
         }
-        // Date appears in many formats; try the canonical YYYY-MM-DD first, then any line containing digits
-        if receipt.header.date.value != "1970-01-01",
-           let box = locateBBox(value: receipt.header.date.value, in: lines, fallbackKeywords: ["date", "time"]) {
-            bboxes["date.value"] = box
+        // Date appears in many formats. Try in order:
+        // 1. literal match of the canonical YYYY-MM-DD value
+        // 2. NSDataDetector on each OCR line — Apple's date detector handles
+        //    "Jan 15, 2026" / "01/15/24" / "15-Jan-26" / etc.
+        // 3. lines containing the "date" or "time" keyword (last resort).
+        if receipt.header.date.value != "1970-01-01" {
+            if let box = locateBBox(value: receipt.header.date.value, in: lines) {
+                bboxes["date.value"] = box
+            } else if let box = locateDateBBox(targetISO: receipt.header.date.value, in: lines) {
+                bboxes["date.value"] = box
+            } else if let box = locateBBox(value: "", in: lines, fallbackKeywords: ["date", "time"]) {
+                bboxes["date.value"] = box
+            }
         }
         if receipt.totals.total > 0,
            let box = locateBBox(amount: receipt.totals.total, in: lines, requireKeyword: "total") {
@@ -288,6 +297,43 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         receipt.provenance.bboxes = bboxes
         return receipt
+    }
+
+    /// Use Apple's NSDataDetector to find any date-shaped text in the OCR
+    /// lines, then pick the line whose detected date matches the target
+    /// ISO date. Handles "Feb 4, 2024", "02/04/24", "4-Feb-24", etc. without
+    /// needing case-by-case regex.
+    private static func locateDateBBox(
+        targetISO: String,
+        in lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt.BBox? {
+        let targetFormatter = DateFormatter()
+        targetFormatter.dateFormat = "yyyy-MM-dd"
+        targetFormatter.timeZone = TimeZone(identifier: "UTC")
+        targetFormatter.locale = Locale(identifier: "en_US_POSIX")
+        guard let targetDate = targetFormatter.date(from: targetISO) else { return nil }
+        let targetDay = Calendar(identifier: .gregorian).startOfDay(for: targetDate)
+
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue) else {
+            return nil
+        }
+        for line in lines {
+            let range = NSRange(line.text.startIndex..<line.text.endIndex, in: line.text)
+            let matches = detector.matches(in: line.text, options: [], range: range)
+            for match in matches {
+                guard let d = match.date else { continue }
+                if Calendar(identifier: .gregorian).startOfDay(for: d) == targetDay {
+                    return line.box
+                }
+            }
+        }
+        // Fallback: any line that contains a numeric date pattern.
+        for line in lines {
+            if line.text.range(of: #"\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b|\b\d{4}[/\-]\d{1,2}[/\-]\d{1,2}\b"#, options: .regularExpression) != nil {
+                return line.box
+            }
+        }
+        return nil
     }
 
     private static func locateBBox(
