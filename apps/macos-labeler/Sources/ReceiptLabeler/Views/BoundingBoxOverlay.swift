@@ -3,25 +3,20 @@ import SwiftUI
 
 /// Two-layer overlay on top of the receipt image:
 ///
-/// 1. **All OCR observations** rendered as faint outlines. Vision knows the
-///    exact pixel position of every line of text it recognized — this layer
-///    surfaces all of them so the user can SEE what was detected.
-/// 2. **Claimed fields** rendered as solid colored rectangles on top
-///    (Merchant/blue, Date/green, Total/red, etc.) — pulled from
-///    `draft.effectiveBBoxes` so they update live as the user reassigns.
-///
-/// Clicking any OCR line opens a Menu that lets you assign that line to a
-/// field. This is more reliable than substring-matching extracted values
-/// back to lines: Vision tells us EXACTLY where the text is; we just let
-/// the user pick which line maps to which field.
+/// 1. **All OCR observations** rendered as faint outlines — click any to
+///    open a popover to assign it to a field, OR if a field is currently
+///    selected, click to assign directly without the popover.
+/// 2. **Claimed fields** rendered as solid colored rectangles. The one
+///    matching `draft.selectedBBoxKey` gets a highlighted ring and a
+///    drag-gesture handler — drag it to move the bbox to a new location.
 struct BoundingBoxOverlay: View {
 
     @Bindable var draft: LabelDraft
 
     var body: some View {
         // GeometryReader inside an `.overlay()` of an Image reports the
-        // image's actual display size, not the parent ZStack's size. That
-        // makes normalized-coord → display-coord mapping consistent.
+        // image's actual display size — required for normalized coords to
+        // map cleanly onto the visible image.
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 // Layer 1: all OCR lines as faint click-targets
@@ -29,37 +24,105 @@ struct BoundingBoxOverlay: View {
                     OCRLineButton(
                         line: line,
                         size: geo.size,
-                        assignedField: assignedField(for: line),
+                        selectedKey: draft.selectedBBoxKey,
                         onAssign: { field in
+                            draft.assign(line: line, to: field)
+                            draft.selectedBBoxKey = field.bboxKey
+                        },
+                        onAssignToSelected: {
+                            guard let key = draft.selectedBBoxKey,
+                                  let field = LabelDraft.FieldTarget.allCases.first(where: { $0.bboxKey == key })
+                            else { return }
                             draft.assign(line: line, to: field)
                         }
                     )
                 }
                 // Layer 2: solid colored rectangles for claimed fields
                 ForEach(claimedBoxes) { item in
-                    claimedView(item, in: geo.size)
+                    ClaimedBoxView(
+                        item: item,
+                        canvasSize: geo.size,
+                        isSelected: item.bboxKey == draft.selectedBBoxKey,
+                        onSelect: { draft.selectedBBoxKey = item.bboxKey },
+                        onDragEnd: { delta in
+                            draft.translateBBox(key: item.bboxKey, by: delta)
+                        }
+                    )
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
         }
     }
 
-    // MARK: - Claimed-bbox rendering
+    private var claimedBoxes: [ClaimedItem] {
+        var out: [ClaimedItem] = []
+        let bboxes = draft.effectiveBBoxes
+        if let b = bboxes["merchant.name"] {
+            out.append(ClaimedItem(id: "merchant", bboxKey: "merchant.name", label: "Merchant", color: .blue, bbox: b))
+        }
+        if let b = bboxes["date.value"] {
+            out.append(ClaimedItem(id: "date", bboxKey: "date.value", label: "Date", color: .green, bbox: b))
+        }
+        if let b = bboxes["totals.subtotal"] {
+            out.append(ClaimedItem(id: "subtotal", bboxKey: "totals.subtotal", label: "Subtotal", color: .purple, bbox: b))
+        }
+        if let b = bboxes["totals.total"] {
+            out.append(ClaimedItem(id: "total", bboxKey: "totals.total", label: "Total", color: .red, bbox: b))
+        }
+        let itemBoxes = bboxes
+            .filter { $0.key.hasPrefix("lineItem.") }
+            .sorted { $0.key < $1.key }
+        for (idx, kv) in itemBoxes.enumerated() {
+            out.append(ClaimedItem(id: "li-\(idx)", bboxKey: kv.key, label: "Item", color: .yellow, bbox: kv.value))
+        }
+        return out
+    }
 
-    @ViewBuilder
-    private func claimedView(_ item: ClaimedItem, in size: CGSize) -> some View {
+    fileprivate struct ClaimedItem: Identifiable {
+        let id: String
+        let bboxKey: String
+        let label: String
+        let color: Color
+        let bbox: OCRKit.Receipt.BBox
+    }
+}
+
+// MARK: - Claimed-box view with selection + drag
+
+private struct ClaimedBoxView: View {
+    let item: BoundingBoxOverlay.ClaimedItem
+    let canvasSize: CGSize
+    let isSelected: Bool
+    let onSelect: () -> Void
+    let onDragEnd: (CGSize) -> Void
+
+    @State private var dragOffset: CGSize = .zero
+
+    var body: some View {
         let rect = CGRect(
-            x: item.bbox.x * size.width,
-            y: item.bbox.y * size.height,
-            width: item.bbox.width * size.width,
-            height: item.bbox.height * size.height
+            x: item.bbox.x * canvasSize.width,
+            y: item.bbox.y * canvasSize.height,
+            width: item.bbox.width * canvasSize.width,
+            height: item.bbox.height * canvasSize.height
         )
+
         ZStack(alignment: .topLeading) {
             Rectangle()
-                .stroke(item.color, lineWidth: 2)
-                .background(item.color.opacity(0.10))
+                .stroke(item.color, lineWidth: isSelected ? 3 : 2)
+                .background(item.color.opacity(isSelected ? 0.18 : 0.10))
                 .frame(width: rect.width, height: rect.height)
-                .allowsHitTesting(false)  // pass clicks through to the OCRLineButton beneath
+            // Corner pips on the selected box give it a "draggable handle" feel.
+            if isSelected {
+                ForEach(0..<4, id: \.self) { corner in
+                    Circle()
+                        .fill(item.color)
+                        .frame(width: 8, height: 8)
+                        .offset(
+                            x: corner % 2 == 0 ? -4 : (rect.width - 4),
+                            y: corner < 2 ? -4 : (rect.height - 4)
+                        )
+                }
+            }
             Text(item.label)
                 .font(.system(size: 9, weight: .semibold))
                 .padding(.horizontal, 4)
@@ -68,51 +131,36 @@ struct BoundingBoxOverlay: View {
                 .foregroundStyle(.white)
                 .cornerRadius(2)
                 .offset(x: 0, y: -14)
-                .allowsHitTesting(false)
         }
-        .offset(x: rect.minX, y: rect.minY)
-    }
-
-    private var claimedBoxes: [ClaimedItem] {
-        var out: [ClaimedItem] = []
-        let bboxes = draft.effectiveBBoxes
-        if let b = bboxes["merchant.name"] {
-            out.append(ClaimedItem(id: "merchant", label: "Merchant", color: .blue, bbox: b))
-        }
-        if let b = bboxes["date.value"] {
-            out.append(ClaimedItem(id: "date", label: "Date", color: .green, bbox: b))
-        }
-        if let b = bboxes["totals.subtotal"] {
-            out.append(ClaimedItem(id: "subtotal", label: "Subtotal", color: .purple, bbox: b))
-        }
-        if let b = bboxes["totals.total"] {
-            out.append(ClaimedItem(id: "total", label: "Total", color: .red, bbox: b))
-        }
-        let itemBoxes = bboxes
-            .filter { $0.key.hasPrefix("lineItem.") }
-            .sorted { $0.key < $1.key }
-        for (idx, kv) in itemBoxes.enumerated() {
-            out.append(ClaimedItem(id: "li-\(idx)", label: "Item", color: .yellow, bbox: kv.value))
-        }
-        return out
-    }
-
-    /// If `line` matches one of the claimed bboxes exactly, return the field
-    /// kind so the click menu can show the current assignment.
-    private func assignedField(for line: OCRLine) -> String? {
-        for (key, box) in draft.effectiveBBoxes {
-            if box == line.box {
-                return key
-            }
-        }
-        return nil
-    }
-
-    private struct ClaimedItem: Identifiable {
-        let id: String
-        let label: String
-        let color: Color
-        let bbox: OCRKit.Receipt.BBox
+        .offset(x: rect.minX + dragOffset.width, y: rect.minY + dragOffset.height)
+        .contentShape(Rectangle())
+        // Tap selects; drag (only when already selected) moves. exclusively
+        // ensures a stationary click never accidentally triggers a drag and
+        // a real drag never falsely fires as a tap.
+        .gesture(
+            TapGesture()
+                .onEnded { _ in onSelect() }
+                .exclusively(before:
+                    DragGesture(minimumDistance: 4)
+                        .onChanged { value in
+                            guard isSelected else { return }
+                            dragOffset = value.translation
+                        }
+                        .onEnded { value in
+                            guard isSelected else {
+                                dragOffset = .zero
+                                return
+                            }
+                            let normalized = CGSize(
+                                width: value.translation.width / canvasSize.width,
+                                height: value.translation.height / canvasSize.height
+                            )
+                            onDragEnd(normalized)
+                            dragOffset = .zero
+                        }
+                )
+        )
+        .help("\(item.label): tap to select, drag to move")
     }
 }
 
@@ -121,8 +169,9 @@ struct BoundingBoxOverlay: View {
 private struct OCRLineButton: View {
     let line: OCRLine
     let size: CGSize
-    let assignedField: String?
+    let selectedKey: String?
     let onAssign: (LabelDraft.FieldTarget) -> Void
+    let onAssignToSelected: () -> Void
 
     @State private var hovering = false
     @State private var showMenu = false
@@ -146,12 +195,19 @@ private struct OCRLineButton: View {
         .frame(width: rect.width, height: rect.height)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .onTapGesture { showMenu = true }
-        .help(line.text)
+        .onTapGesture {
+            // If a field is selected, single-click assigns directly. Else show menu.
+            if selectedKey != nil {
+                onAssignToSelected()
+            } else {
+                showMenu = true
+            }
+        }
+        .help(selectedKey != nil ? "Click to set as \(selectedKey ?? "")\n\(line.text)" : "\(line.text) — click to assign")
         .popover(isPresented: $showMenu, arrowEdge: .bottom) {
             assignmentMenu
                 .padding(8)
-                .frame(minWidth: 200)
+                .frame(minWidth: 220)
         }
         .offset(x: rect.minX, y: rect.minY)
     }

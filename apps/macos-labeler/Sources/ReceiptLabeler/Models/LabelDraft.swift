@@ -47,6 +47,12 @@ final class LabelDraft {
     /// Merged into `effectiveBBoxes` for the overlay + into provenance on save.
     var bboxOverrides: [String: OCRKit.Receipt.BBox] = [:]
 
+    /// Currently-selected bbox key (e.g. "merchant.name", "totals.total").
+    /// Driven from both sides — tapping a form row sets it, tapping a bbox
+    /// sets it — and powers the selection ring + drag-to-move affordance
+    /// on the overlay.
+    var selectedBBoxKey: String? = nil
+
     private let labelExisting: LabelDocument.LabelMetadata?
 
     // MARK: - Init
@@ -150,12 +156,34 @@ final class LabelDraft {
         basis.provenance.bboxes.merging(bboxOverrides) { _, override in override }
     }
 
-    enum FieldTarget: String, Sendable {
+    enum FieldTarget: String, Sendable, CaseIterable {
         case merchant
         case date
         case total
         case subtotal
         case lineItem
+
+        /// The bbox key this target writes to (for non-lineItem cases).
+        var bboxKey: String? {
+            switch self {
+            case .merchant: return "merchant.name"
+            case .date:     return "date.value"
+            case .total:    return "totals.total"
+            case .subtotal: return "totals.subtotal"
+            case .lineItem: return nil  // dynamic index, computed at assignment time
+            }
+        }
+    }
+
+    /// Move a bbox by a normalized delta. Used by drag gestures on the
+    /// selected bbox; clamps so the box stays inside [0,1].
+    func translateBBox(key: String, by delta: CGSize) {
+        guard var box = effectiveBBoxes[key] else { return }
+        let newX = max(0, min(1 - box.width, box.x + Double(delta.width)))
+        let newY = max(0, min(1 - box.height, box.y + Double(delta.height)))
+        box.x = newX
+        box.y = newY
+        bboxOverrides[key] = box
     }
 
     /// Assign an OCR line's text + bbox to a field. The form value updates
