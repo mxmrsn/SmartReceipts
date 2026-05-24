@@ -32,24 +32,29 @@ struct ZoomableImageView<Overlay: View>: View {
         GeometryReader { geo in
             ScrollView([.horizontal, .vertical]) {
                 if let image {
-                    ZStack(alignment: .topLeading) {
-                        Image(nsImage: image)
-                            .resizable()
-                            .interpolation(.medium)
-                        if showOverlay {
-                            overlay
+                    // Image with the overlay attached via .overlay() — this
+                    // guarantees the overlay's GeometryReader sees the same
+                    // size as the image's actual display frame, eliminating
+                    // the "overlay 2x bigger than image" bug we'd otherwise
+                    // get with a sibling ZStack.
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.medium)
+                        .frame(
+                            width: image.size.width * zoom,
+                            height: image.size.height * zoom
+                        )
+                        .overlay {
+                            if showOverlay {
+                                overlay
+                            }
                         }
-                    }
-                    .frame(
-                        width: image.size.width * zoom,
-                        height: image.size.height * zoom
-                    )
-                    .padding(16)
-                    .frame(
-                        minWidth: geo.size.width,
-                        minHeight: geo.size.height,
-                        alignment: .center
-                    )
+                        .padding(16)
+                        .frame(
+                            minWidth: geo.size.width,
+                            minHeight: geo.size.height,
+                            alignment: .center
+                        )
                 } else {
                     ProgressView()
                         .frame(

@@ -19,6 +19,9 @@ struct BoundingBoxOverlay: View {
     @Bindable var draft: LabelDraft
 
     var body: some View {
+        // GeometryReader inside an `.overlay()` of an Image reports the
+        // image's actual display size, not the parent ZStack's size. That
+        // makes normalized-coord → display-coord mapping consistent.
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
                 // Layer 1: all OCR lines as faint click-targets
@@ -37,7 +40,7 @@ struct BoundingBoxOverlay: View {
                     claimedView(item, in: geo.size)
                 }
             }
-            .frame(width: geo.size.width, height: geo.size.height)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
         }
     }
 
@@ -133,11 +136,11 @@ private struct OCRLineButton: View {
         )
         ZStack {
             Rectangle()
-                .fill(hovering ? Color.accentColor.opacity(0.30) : Color.cyan.opacity(0.18))
+                .fill(hovering ? Color.accentColor.opacity(0.25) : Color.cyan.opacity(0.10))
             Rectangle()
                 .strokeBorder(
-                    hovering ? Color.accentColor : Color.cyan,
-                    lineWidth: hovering ? 2.5 : 1.2
+                    hovering ? Color.accentColor : Color.cyan.opacity(0.75),
+                    lineWidth: hovering ? 2.0 : 0.8
                 )
         }
         .frame(width: rect.width, height: rect.height)
