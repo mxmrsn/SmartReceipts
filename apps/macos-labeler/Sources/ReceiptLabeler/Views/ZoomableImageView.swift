@@ -14,11 +14,12 @@ struct ZoomableImageView<Overlay: View>: View {
     @State private var fitZoom: CGFloat = 1.0
     @State private var containerSize: CGSize = .zero
     @State private var showOverlay: Bool = true
-    /// URL we've already auto-fitted for. Cleared when `url` changes so the
-    /// next receipt's first valid (image, container) pair triggers a fresh
-    /// fit-to-window. Without this, navigating between receipts left the
-    /// zoom at whatever the previous one had.
-    @State private var fittedFor: URL? = nil
+    /// True once the user has touched the slider, +/- buttons, or 100%.
+    /// While this is false we keep snapping `zoom` to `fitZoom` on every
+    /// layout change — which is the only way to win the race against
+    /// SwiftUI's layout settling after a new receipt loads. Reset to false
+    /// when navigating to a new URL.
+    @State private var userZoomed: Bool = false
 
     private let minZoom: CGFloat = 0.05
     private let maxZoom: CGFloat = 4.0
@@ -71,23 +72,19 @@ struct ZoomableImageView<Overlay: View>: View {
             .background(Color(nsColor: .controlBackgroundColor))
             // Keep containerSize in lock-step with the GeometryReader's
             // measurement. `initial: true` seeds it on first appearance.
+            // applyFit() also re-snaps zoom while userZoomed is false, so
+            // late layout passes correct any too-small initial fit.
             .onChange(of: geo.size, initial: true) { _, newSize in
                 containerSize = newSize
-                tryAutoFit()
+                applyFit()
             }
             .task(id: url) {
-                fittedFor = nil
+                userZoomed = false
                 image = ImageLoader.shared.fullImage(for: url)
-                // Give SwiftUI a couple frames to finish laying out the
-                // ScrollView before computing fit. Without this, on a fresh
-                // ZoomableImageView (new entry via .id() change),
-                // containerSize is still .zero when the task runs and the
-                // fit guard bails silently.
-                try? await Task.sleep(for: .milliseconds(60))
-                tryAutoFit()
+                applyFit()
             }
             .onChange(of: image) { _, _ in
-                tryAutoFit()
+                applyFit()
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -114,19 +111,24 @@ struct ZoomableImageView<Overlay: View>: View {
             .help("Zoom in (⌘+)")
             .keyboardShortcut("=", modifiers: [.command])
 
-            Slider(value: $zoom, in: minZoom...maxZoom)
-                .frame(minWidth: 120, idealWidth: 180, maxWidth: 240)
+            Slider(value: $zoom, in: minZoom...maxZoom) { editing in
+                if !editing { userZoomed = true }
+            }
+            .frame(minWidth: 120, idealWidth: 180, maxWidth: 240)
 
             Button("Fit") {
-                fittedFor = nil       // force re-fit
-                tryAutoFit()
+                userZoomed = false
+                applyFit()
             }
             .help("Fit window (⌘0)")
             .keyboardShortcut("0", modifiers: [.command])
 
-            Button("100%") { zoom = 1.0 }
-                .help("Actual size (⌘1)")
-                .keyboardShortcut("1", modifiers: [.command])
+            Button("100%") {
+                userZoomed = true
+                zoom = 1.0
+            }
+            .help("Actual size (⌘1)")
+            .keyboardShortcut("1", modifiers: [.command])
 
             Divider().frame(height: 18)
 
@@ -139,22 +141,10 @@ struct ZoomableImageView<Overlay: View>: View {
 
             Spacer(minLength: 8)
 
-            HStack(spacing: 6) {
-                if let image {
-                    Text("img \(Int(image.size.width))×\(Int(image.size.height))")
-                        .font(.system(size: 9, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-                Text("pane \(Int(containerSize.width))×\(Int(containerSize.height))")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                Text("fit \(Int((fitZoom * 100).rounded()))%")
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                Text("\(Int((zoom * 100).rounded()))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
+            Text("\(Int((zoom * 100).rounded()))%")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(minWidth: 48, alignment: .trailing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -164,15 +154,16 @@ struct ZoomableImageView<Overlay: View>: View {
     // MARK: - Sizing
 
     private func adjustZoom(by factor: CGFloat) {
+        userZoomed = true
         zoom = (zoom * factor).clamped(to: minZoom...maxZoom)
     }
 
-    /// Recompute the fit-to-window scale. If both image + containerSize are
-    /// valid AND we haven't auto-fitted for the current URL yet, also snap
-    /// `zoom` to `fitZoom`. This decouples "image loads" and "first layout
-    /// gives us a container size" — whichever finishes second triggers the
-    /// fit, so the user never lands on a stale 100% zoom from before.
-    private func tryAutoFit() {
+    /// Recompute fit-to-window scale and apply it to `zoom` if the user
+    /// hasn't manually zoomed for this receipt yet. Runs on every layout
+    /// change (geo.size, image, url) — that way late layout settling can
+    /// still correct an initial too-small fit before the user has touched
+    /// anything.
+    private func applyFit() {
         guard let image, containerSize.width > 0, containerSize.height > 0 else { return }
         let padding: CGFloat = 32
         let avail = CGSize(
@@ -185,9 +176,8 @@ struct ZoomableImageView<Overlay: View>: View {
         // scroll vertically; landscape ones fill height. Cap at 1.0 so we
         // never enlarge past native resolution.
         fitZoom = max(minZoom, min(max(scaleW, scaleH), 1.0))
-        if fittedFor != url {
+        if !userZoomed {
             zoom = fitZoom
-            fittedFor = url
         }
     }
 }
