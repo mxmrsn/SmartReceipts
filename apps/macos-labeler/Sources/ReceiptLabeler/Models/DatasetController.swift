@@ -17,8 +17,10 @@ final class DatasetController {
     var selectedID: UUID?
     var statusMessage: String?
 
-    /// Pre-label draft fetched from OCRKit when the user selects an unlabeled image.
-    var pendingDraft: OCRKit.Receipt?
+    /// Full ExtractionResult from the most recent pre-label run. The form
+    /// reads both `.receipt` (for field values) and `.rawText` (for the raw OCR
+    /// section so the user can verify what the OCR actually saw).
+    var pendingExtraction: OCRKit.ExtractionResult?
     var isExtracting: Bool = false
 
     var store: LabelStore { LabelStore(datasetDirectory: datasetDirectory) }
@@ -62,7 +64,7 @@ final class DatasetController {
 
     func select(_ id: UUID?) {
         selectedID = id
-        pendingDraft = nil
+        pendingExtraction = nil
     }
 
     var selectedEntry: DatasetEntry? {
@@ -92,7 +94,12 @@ final class DatasetController {
             let result = try await pipeline.extract(image: cgImage)
             var canonical = result.receipt
             canonical.imageId = entry.imageId  // anchor to the dataset-stable id
-            pendingDraft = canonical
+            pendingExtraction = OCRKit.ExtractionResult(
+                receipt: canonical,
+                latencyMs: result.latencyMs,
+                peakMemoryMB: result.peakMemoryMB,
+                rawText: result.rawText
+            )
             statusMessage = "Pre-label generated for \(entry.sourceFilename) in \(result.latencyMs) ms"
         } catch {
             statusMessage = "Pre-label failed: \(error.localizedDescription)"

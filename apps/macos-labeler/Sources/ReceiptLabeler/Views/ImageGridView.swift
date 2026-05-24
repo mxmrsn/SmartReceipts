@@ -51,7 +51,13 @@ struct ImageGridView: View {
     private var bindingSelection: Binding<UUID?> {
         Binding(
             get: { controller.selectedID },
-            set: { controller.select($0) }
+            // Defer the controller mutation past the current List update cycle
+            // to avoid the "reentrant operation in NSTableView delegate" warning.
+            set: { newValue in
+                Task { @MainActor in
+                    controller.select(newValue)
+                }
+            }
         )
     }
 }

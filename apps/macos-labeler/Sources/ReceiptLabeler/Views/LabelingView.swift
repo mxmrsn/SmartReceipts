@@ -2,9 +2,9 @@ import AppKit
 import OCRKit
 import SwiftUI
 
-/// Detail pane: receipt image on the left, editable canonical Receipt form on
-/// the right. Loads either the existing label or a fresh OCRKit pre-label and
-/// merges either back into a `LabelDraft` for editing.
+/// Detail pane: zoomable receipt image on the left, editable canonical
+/// Receipt form on the right. Loads either the existing label or a fresh
+/// OCRKit pre-label and merges either back into a `LabelDraft` for editing.
 struct LabelingView: View {
 
     @Bindable var controller: DatasetController
@@ -28,58 +28,41 @@ struct LabelingView: View {
 
     private func workspace(draft: LabelDraft) -> some View {
         HSplitView {
-            imagePane
-                .frame(minWidth: 320)
+            ZoomableImageView(url: entry.imageURL)
+                .frame(minWidth: 360)
             ReceiptFormSection(
                 draft: draft,
                 onSaveDraft: { save(draft: draft, as: .draft) },
                 onVerify:    { save(draft: draft, as: .verified) },
                 onReject:    { save(draft: draft, as: .rejected) }
             )
-            .frame(minWidth: 360)
+            .frame(minWidth: 380)
         }
-    }
-
-    private var imagePane: some View {
-        ScrollView([.horizontal, .vertical]) {
-            if let image = ImageLoader.shared.fullImage(for: entry.imageURL) {
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .padding(16)
-            } else {
-                Text("Could not load image")
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .background(Color(nsColor: .controlBackgroundColor))
     }
 
     // MARK: - Draft lifecycle
 
     private func prepareDraft() async {
-        // If we have an on-disk label, use it as the basis.
         if let doc = entry.label {
             draft = LabelDraft(from: doc)
             return
         }
 
-        // Otherwise run the baseline pipeline to pre-fill.
         await controller.runPreLabel(for: entry)
-        if let pending = controller.pendingDraft {
+        if let extraction = controller.pendingExtraction {
             draft = LabelDraft(
-                fromPreLabel: pending,
+                fromPreLabel: extraction.receipt,
                 sourceFilename: entry.sourceFilename,
-                pipelineId: pending.provenance.pipelineId
+                pipelineId: extraction.receipt.provenance.pipelineId,
+                rawText: extraction.rawText
             )
         } else {
-            // Fall back: an empty draft anchored to this image's id.
             let blank = blankCanonicalReceipt(imageId: entry.imageId)
             draft = LabelDraft(
                 fromPreLabel: blank,
                 sourceFilename: entry.sourceFilename,
-                pipelineId: "none"
+                pipelineId: "none",
+                rawText: nil
             )
         }
     }
