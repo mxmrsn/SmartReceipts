@@ -116,6 +116,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // tax-category segments that survive clustering on their own bbox.
         let rows = mergedRows
             .filter { !Self.isOrphanedNumericRow($0) }
+            // Drop entire rows whose joined text contains a hard
+            // discount/metadata marker. After clustering, the row "WT
+            // 12.67 Regular Price" survives because none of its individual
+            // observations is purely a "Regular Price" prefix, but the
+            // row's `12.67` is a regular-price amount, not a real item
+            // price. Feeding it to FM tempts the model to extract it as
+            // a line item (see IMG_1317 picking $12.67 for APPLES when
+            // the actual price was $7.77 on a different row).
+            .filter { !Self.rowContainsHardMetadataMarker($0) }
             .map(Self.stripTrailingSingleLetterSegment)
         let spatialOCR = rows.enumerated().map { idx, row in
             let yPct = Int((row.meanY * 100).rounded())
@@ -159,13 +168,39 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
 
         // ---- 3) Build canonical Receipt ----
-        var receipt = Self.buildReceipt(from: extracted, ocrLines: lines)
-        // Recover line items that FM dropped. If we can see a price in
-        // the column where other prices landed, and there's description
-        // text on the same Y row, treat it as an item the model missed.
-        // This is the user's "if you see a price in the column, look
-        // for text to the left of it" suggestion.
-        receipt = Self.recoverMissedLineItems(receipt: receipt, lines: lines)
+        // Use the price-normalized lines for all post-extraction work
+        // (buildReceipt sanity checks, recovery, bbox attachment). The
+        // raw `lines` array still has Vision's literal output like
+        // "6. 49 S" with the spurious space — without normalization,
+        // priceShape regexes reject the token and the item silently
+        // vanishes from recovery (IMG_1326 B&J at $6.49).
+        let postLines = Self.normalizePriceTokens(lines)
+        var receipt = Self.buildReceipt(from: extracted, ocrLines: postLines)
+        // PRIMARY line-item extraction: scan the price column directly.
+        // The OCR data unambiguously tells us where the prices are. FM's
+        // strength is reading text (merchant name, date, totals labels);
+        // its weakness is structural decisions about WHICH price belongs
+        // to WHICH description on cluttered Safeway / Sprouts receipts.
+        // Column-anchored extraction sidesteps that — every price-shaped
+        // observation in the column is a candidate, filtered against the
+        // totals block, regular-price labels, and savings markers. FM's
+        // items are still used as a HINT source for quantity/unit/category.
+        let fmItems = receipt.lineItems
+        let columnItems = Self.columnAnchoredLineItems(
+            lines: postLines,
+            fmItems: fmItems,
+            totalsValues: Self.totalsValueSet(from: receipt),
+            receiptTotal: receipt.totals.total
+        )
+        if !columnItems.isEmpty {
+            receipt.lineItems = columnItems
+        } else {
+            // Fall back to FM-only items + the legacy post-processors
+            // when column extraction finds nothing (single-item receipts,
+            // very sparse OCR, etc.).
+            receipt = Self.correctRegularPriceMistakes(receipt: receipt, lines: postLines)
+            receipt = Self.recoverMissedLineItems(receipt: receipt, lines: postLines)
+        }
         // Snap merchant to a canonical brand name when we can identify one
         // in the OCR header. Catches FM picking a city ("Colma" for
         // "Target Colma"), an OCR misread ("how doers" for "Home Depot"),
@@ -189,9 +224,21 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 receipt.provenance.fieldConfidence["merchant.name"] = 0.95
             }
         }
+        // Final non-item filter: drop any line items whose description is
+        // clearly a department header ("LIQUOR"), a rewards/coupon line
+        // ("BASKET Grocery Rewards"), or a savings amount ("3.50-").
+        // Catches both FM-emitted and recovered items in one pass; FM
+        // sometimes treats these as items even when the row text makes
+        // it obvious they aren't.
+        receipt.lineItems.removeAll { item in
+            Self.looksLikeNonItemRecoveryCandidate(item.description)
+        }
         // Backfill bboxes by matching extracted field values back to OCR lines.
         // The bbox overlay in the labeler uses these to highlight detections.
-        receipt = Self.attachBBoxes(receipt: receipt, lines: lines)
+        // Uses the normalized lines so a price like "6. 49 S" still matches
+        // its bbox slot — the bbox coordinates are identical to the
+        // original observation either way.
+        receipt = Self.attachBBoxes(receipt: receipt, lines: postLines)
 
         return ExtractionResult(
             receipt: receipt,
@@ -253,8 +300,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         var total: Decimal = parseDecimal(x.total) ?? 0
         var subtotal: Decimal? = parseDecimal(x.subtotal)
         var taxAmount: Decimal? = parseDecimal(x.tax)
-        let tip: Decimal? = parseDecimal(x.tip)
-        let discount: Decimal? = parseDecimal(x.discount)
+        // FM occasionally returns "0" / "0.00" for optional money fields
+        // when the receipt didn't actually print them. Treat zero the
+        // same as missing — saves the labeler from displaying a phantom
+        // "$0.00 tip" the user has to clear manually.
+        let tip: Decimal? = {
+            let v = parseDecimal(x.tip)
+            return (v ?? 0) == 0 ? nil : v
+        }()
+        let discount: Decimal? = {
+            let v = parseDecimal(x.discount)
+            return (v ?? 0) == 0 ? nil : v
+        }()
 
         // Sanity: the grand total can never be less than the subtotal.
         // FM occasionally flips them (we've seen `total = $28.79`,
@@ -291,6 +348,20 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             let computed = total - sub - (tip ?? 0) + (discount ?? 0)
             if computed > 0, computed <= sub {
                 taxAmount = computed
+            }
+        }
+
+        // Subtotal sanity: FM sometimes pulls "BALANCE 18.00" AND
+        // "PAYMENT AMOUNT 18.00" off the receipt and emits BOTH as
+        // total and subtotal — but that's the wrong answer when the
+        // receipt has a real tax line. If subtotal == total and tax
+        // is positive, the printed subtotal was almost certainly
+        // missing and FM duplicated the total. Compute the real
+        // subtotal from the arithmetic.
+        if let sub = subtotal, sub == total, let tax = taxAmount, tax > 0 {
+            let computed = total - tax - (tip ?? 0) + (discount ?? 0)
+            if computed > 0, computed < total {
+                subtotal = computed
             }
         }
 
@@ -383,14 +454,22 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 // Only kick in when total == qty × unit (mathematical
                 // consistency suggests FM did the multiplication).
                 guard abs(cand.price - computed) < Decimal(0.01) else { continue }
-                guard let printedPrice = Self.rightmostPriceInOCRRow(
+                // Inspect every OCR row matching this description. If ANY
+                // of them prints `unit` as the row price (not the inflated
+                // total), FM did the multiplication on its own — reset.
+                // Multi-row matching is the key for receipts like Sprouts
+                // that print two separate "BONE-IN CHCKN THIGHS" lines at
+                // different prices: looking at only the first row would
+                // pick the wrong one half the time.
+                let printedPrices = Self.rightmostPricesInOCRRows(
                     matching: cand.desc, in: ocrLines
-                ) else { continue }
-                // OCR shows unit, not the inflated total → reset.
-                if abs(printedPrice - unit) < Decimal(0.01) {
-                    // Also drop FM's qty — if the printed total was just
-                    // the unit price, the row had no real quantity marker
-                    // and FM was hallucinating.
+                )
+                let anyMatchesUnit = printedPrices.contains { abs($0 - unit) < Decimal(0.01) }
+                let noneMatchesTotal = !printedPrices.contains { abs($0 - cand.price) < Decimal(0.01) }
+                // Reset when the unit price is in the OCR but the inflated
+                // total is NOT — otherwise we'd corrupt a legit case where
+                // the printed row really does have the multiplied total.
+                if anyMatchesUnit && noneMatchesTotal {
                     candidates[i] = Candidate(
                         desc: cand.desc,
                         qty: nil,
@@ -686,7 +765,46 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
         }
 
-        receipt.provenance.bboxes = bboxes
+        // Sort line items into top-to-bottom receipt order. FM
+        // occasionally returns them out of order (jumping departments),
+        // and `recoverMissedLineItems` always appends to the end — so
+        // without this sort, the visually-first item can end up at index
+        // 4. The sort key is the description bbox's Y. Items with no
+        // bbox (locator failed) sink to the bottom of the list — their
+        // relative order is preserved.
+        let withY: [(item: Receipt.LineItem, oldKey: String, y: Double)] =
+            receipt.lineItems.enumerated().map { (idx, item) in
+                let oldKey = String(format: "lineItem.%03d", idx)
+                let y = bboxes[oldKey]?.y ?? Double.greatestFiniteMagnitude
+                return (item, oldKey, y)
+            }
+        let sorted = withY.enumerated().sorted { lhs, rhs in
+            // Stable sort by Y, with original index as tiebreak for
+            // items that share a Y (or both have none).
+            if lhs.element.y != rhs.element.y { return lhs.element.y < rhs.element.y }
+            return lhs.offset < rhs.offset
+        }.map(\.element)
+
+        var renumberedBoxes = bboxes
+        // Strip the old lineItem.* entries before writing the new ones,
+        // otherwise stale keys leak through when the new layout has
+        // fewer items at a given index than the old one had.
+        for k in bboxes.keys where k.hasPrefix("lineItem.") {
+            renumberedBoxes.removeValue(forKey: k)
+        }
+        var newItems: [Receipt.LineItem] = []
+        for (newIdx, entry) in sorted.enumerated() {
+            newItems.append(entry.item)
+            let newKey = String(format: "lineItem.%03d", newIdx)
+            if let descBox = bboxes[entry.oldKey] {
+                renumberedBoxes[newKey] = descBox
+            }
+            if let priceBox = bboxes["\(entry.oldKey).price"] {
+                renumberedBoxes["\(newKey).price"] = priceBox
+            }
+        }
+        receipt.lineItems = newItems
+        receipt.provenance.bboxes = renumberedBoxes
         return receipt
     }
 
@@ -752,22 +870,48 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         excluding: Set<Int>
     ) -> (lineIndex: Int, box: Receipt.BBox)? {
         let amountStr = NSDecimalNumber(decimal: amount).stringValue
-        let tolerance = max(0.01, rowHeight * 1.5)
-        var best: (idx: Int, box: Receipt.BBox)? = nil
+        // Tolerance must cover the gap between two adjacent OCR rows,
+        // which is typically ~1.5–2× a single row's height. The 0.02
+        // floor handles the Happy Hound-style receipt where the price
+        // wraps onto the row below the description — descBox.height
+        // alone underestimates the row spacing.
+        let tolerance = max(0.02, rowHeight * 2.0)
+        // Collect every qualifying candidate, then pick the best by
+        // (closer-Y → rightmost-X). Just picking "rightmost X" breaks on
+        // Safeway-style receipts where the price ABOVE and the price
+        // BELOW a description are both in the same column at the same X —
+        // the iteration order of `lines` (which Vision doesn't sort by Y)
+        // ends up deciding the winner. Closer-Y is the structurally
+        // correct disambiguator: the price on the actual same visual row
+        // is always closer in Y than a neighbor.
+        var candidates: [(idx: Int, box: Receipt.BBox, dy: Double)] = []
         for (idx, line) in lines.enumerated() {
             if excluding.contains(idx) { continue }
             let centerY = line.box.y + line.box.height / 2
-            guard abs(centerY - nearY) <= tolerance else { continue }
+            let dy = abs(centerY - nearY)
+            guard dy <= tolerance else { continue }
             // Match either the exact value, or a comma-decimal variant
-            // (Vision reads "4,00" while FM normalizes to "4.00").
-            let dotted = line.text.replacingOccurrences(of: ",", with: ".")
+            // (Vision reads "4,00" while FM normalizes to "4.00"), or a
+            // hyphen-decimal variant (small-font receipts read "11.75"
+            // as "11-75"). The hyphen substitution is constrained to
+            // digit-hyphen-digit so we don't accidentally rewrite real
+            // hyphens elsewhere (e.g. "sub-total").
+            let dotted = line.text
+                .replacingOccurrences(of: ",", with: ".")
+                .replacingOccurrences(
+                    of: #"(\d)-(\d)"#,
+                    with: "$1.$2",
+                    options: .regularExpression
+                )
             guard line.text.contains(amountStr) || dotted.contains(amountStr) else { continue }
-            // Prefer the rightmost qualifying line (highest x).
-            if best == nil || line.box.x > best!.box.x {
-                best = (idx, line.box)
-            }
+            candidates.append((idx, line.box, dy))
         }
-        return best.map { ($0.idx, $0.box) }
+        // Sort: closer-Y first, rightmost-X as tiebreak.
+        candidates.sort { a, b in
+            if a.dy != b.dy { return a.dy < b.dy }
+            return a.box.x > b.box.x
+        }
+        return candidates.first.map { ($0.idx, $0.box) }
     }
 
     /// Use Apple's NSDataDetector to find any date-shaped text in the OCR
@@ -983,6 +1127,216 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// "2 QTY DE CECCO  L  6.00", which FM left out for unclear reasons
     /// even though the row is in the prompt.
     ///
+    /// Build the set of receipt-level totals values we should NEVER
+    /// promote to a line item. Used by both `columnAnchoredLineItems`
+    /// and `recoverMissedLineItems`.
+    private static func totalsValueSet(from receipt: Receipt) -> Set<Decimal> {
+        var out: Set<Decimal> = [receipt.totals.total]
+        if let s = receipt.totals.subtotal { out.insert(s) }
+        for t in receipt.totals.tax { out.insert(t.amount) }
+        if let t = receipt.totals.tip { out.insert(t) }
+        if let d = receipt.totals.discount { out.insert(d) }
+        return out
+    }
+
+    /// PRIMARY line-item extraction — walks the price column and emits
+    /// a line item for every price observation that isn't a totals
+    /// block value, a regular-price amount, or a savings amount.
+    ///
+    /// Why column-anchored, not FM-output-anchored:
+    /// FM is unreliable on dense Safeway/Sprouts receipts (drops items,
+    /// picks regular prices, hallucinates qty × unit math). The price
+    /// column, by contrast, is unambiguous: Vision puts every price-
+    /// shaped token at a known X. Walking the column and pairing each
+    /// price with the description on the same Y gives us the structural
+    /// truth of the receipt. FM is then used as a HINT source for
+    /// quantity / unit / category, and remains the sole authority for
+    /// merchant name, date, and totals.
+    ///
+    /// Pipeline:
+    ///   1. Collect every price-shaped OCR observation. The median X
+    ///      defines the column (±5%).
+    ///   2. Discard everything below the first totals-block boundary.
+    ///   3. Discard amounts equal to subtotal / tax / tip / total.
+    ///   4. Discard amounts whose row sits adjacent (Δy ≤ 0.006) to a
+    ///      "Regular Price" / "Member Savings" / "you save" label.
+    ///   5. For each surviving price, JOIN every text observation on
+    ///      the same visual row to the left of the price (sorted by X)
+    ///      into the description string. Joining (vs picking the
+    ///      leftmost) recovers multi-segment descriptions like
+    ///      "SIG  BOUILLON CHKN".
+    ///   6. Run the joined description through `cleanLineItemDescription`,
+    ///      `isFooterRow`, and `looksLikeNonItemRecoveryCandidate` to
+    ///      drop department headers / "Price"-only fragments / SKUs.
+    ///   7. Match against FM's items by (price equal, description
+    ///      prefix overlap) to inherit quantity / unitPrice / category.
+    ///
+    /// Returns empty when fewer than 2 prices land in the column —
+    /// caller falls back to the FM-only path.
+    private static func columnAnchoredLineItems(
+        lines: [(text: String, box: Receipt.BBox)],
+        fmItems: [Receipt.LineItem],
+        totalsValues: Set<Decimal>,
+        receiptTotal: Decimal
+    ) -> [Receipt.LineItem] {
+        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+
+        // Step 1: every price-shaped observation with its value.
+        struct PricePoint {
+            let value: Decimal
+            let box: Receipt.BBox
+            let centerY: Double
+            let lineIdx: Int
+        }
+        var pricePoints: [PricePoint] = []
+        for (idx, line) in lines.enumerated() {
+            let trimmed = line.text.trimmingCharacters(in: .whitespaces)
+            guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
+            let normalized = trimmed
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: ",", with: ".")
+                .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
+            guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
+            guard v > 0 else { continue }
+            pricePoints.append(PricePoint(
+                value: v,
+                box: line.box,
+                centerY: line.box.y + line.box.height / 2,
+                lineIdx: idx
+            ))
+        }
+        guard pricePoints.count >= 2 else { return [] }
+
+        // Step 1b: price column = median X ± 5%.
+        let xs = pricePoints.map(\.box.x).sorted()
+        let medianX = xs[xs.count / 2]
+        let columnLo = max(0.0, medianX - 0.05)
+        let columnHi = medianX + 0.05
+
+        // Step 2: totals-block Y boundary. Anything at or below is
+        // payment / footer noise.
+        let totalsKeywords: [String] = [
+            "subtotal", "sub-total", "tax", "balance", "total",
+            "amount due", "amount paid", "payment amount", "tip", "change",
+        ]
+        var totalsBlockY: Double = 1.0
+        for line in lines {
+            if Self.lineLooksLikeTotalsBoundary(line.text, keywords: totalsKeywords) {
+                let cy = line.box.y + line.box.height / 2
+                if cy < totalsBlockY { totalsBlockY = cy }
+            }
+        }
+
+        // Step 4 (precompute): Y centers of every regular-price /
+        // member-savings / you-save label observation.
+        let labelPatterns: [String] = [
+            "regular price", "resular price", "reqular price",
+            "recular price", "repular price", "reaular price",
+            "member savings", "member saving",
+            "member savinas", "member savinos", "member savincs",
+            "for personalized", "forl personalized",
+            "you save", "you saved",
+        ]
+        let labelYs: [Double] = lines.compactMap { line in
+            let lc = line.text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            let isLabel = labelPatterns.contains { lc == $0 || lc.hasPrefix($0 + " ") }
+            return isLabel ? line.box.y + line.box.height / 2 : nil
+        }
+
+        // Step 5–7: walk surviving prices in Y order.
+        let inColumn = pricePoints
+            .filter { columnLo <= $0.box.x && $0.box.x <= columnHi }
+            .sorted { $0.centerY < $1.centerY }
+
+        var items: [Receipt.LineItem] = []
+        for p in inColumn {
+            // Filter: below the totals block.
+            if p.centerY >= totalsBlockY - 0.002 { continue }
+            // Filter: equals a known totals value.
+            if totalsValues.contains(p.value) { continue }
+            // Filter: adjacent to a regular-price / member-savings label.
+            if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { continue }
+            // Filter: implausibly large value. Vision sometimes mangles a
+            // price like "$4.99" into just "99" (decimal point lost). The
+            // resulting "$99" exceeds the receipt total and is obviously
+            // wrong. Drop anything that's strictly greater than the total.
+            if receiptTotal > 0, p.value > receiptTotal { continue }
+
+            // Pick the BEST single text observation to the left, within
+            // ±2 line-heights vertically. Strategy:
+            //   * Group candidates into Y-buckets of 0.005 (truly same
+            //     row vs neighboring row).
+            //   * Across buckets, prefer the closer one (smaller dy).
+            //   * Within a bucket, prefer the LONGEST text — that's
+            //     the actual product name, not a brand prefix like "SIG"
+            //     or a side marker like "S" or "WT".
+            // Joining wasn't worth it: most receipts split descriptions
+            // across multiple Y values (Vision puts "SIG" on one
+            // baseline and "BOUILLON CHKN" on another), so a generous
+            // tolerance ends up dragging in the previous-row header
+            // ("PRODUCE", "DAIRY") too.
+            let rowTol = max(0.012, p.box.height * 2.0)
+            var candidates: [(text: String, x: Double, dy: Double)] = []
+            for line in lines {
+                let cy = line.box.y + line.box.height / 2
+                let dy = abs(cy - p.centerY)
+                guard dy <= rowTol else { continue }
+                guard line.box.x < p.box.x else { continue }
+                let t = line.text.trimmingCharacters(in: .whitespaces)
+                guard t.count >= 3 else { continue }
+                // Skip other price-shaped tokens.
+                if t.range(of: priceShape, options: .regularExpression) != nil { continue }
+                candidates.append((t, line.box.x, dy))
+            }
+            guard !candidates.isEmpty else { continue }
+
+            candidates.sort { a, b in
+                // Bucket dy by 0.005 — descriptions on truly the same row
+                // (Vision baseline jitter) should all count as equally
+                // close.
+                let aBucket = (a.dy / 0.005).rounded(.down)
+                let bBucket = (b.dy / 0.005).rounded(.down)
+                if aBucket != bBucket { return aBucket < bBucket }
+                // Within the bucket, deprioritize "noisy" text (mostly
+                // tax markers / vol indicators / department headers).
+                // "SNGL TAX" loses to "CRV BEER" even though both have
+                // the same length and same dy — neither word in CRV BEER
+                // is a known metadata fragment.
+                let aNoisy = Self.descriptionIsMostlyNoise(a.text)
+                let bNoisy = Self.descriptionIsMostlyNoise(b.text)
+                if aNoisy != bNoisy { return !aNoisy }
+                // Otherwise pick the longer text — almost always the
+                // real product name vs a brand prefix.
+                return a.text.count > b.text.count
+            }
+            let bestText = candidates.first!.text
+
+            let cleaned = Self.cleanLineItemDescription(bestText)
+            guard cleaned.count >= 3 else { continue }
+            guard !Self.isFooterRow(cleaned) else { continue }
+            guard !Self.looksLikeNonItemRecoveryCandidate(cleaned) else { continue }
+
+            // Step 7: inherit qty / unit / category from FM if it
+            // extracted a matching item.
+            let cleanedLower = cleaned.lowercased()
+            let needle = String(cleanedLower.prefix(4))
+            let fmMatch = fmItems.first { fm in
+                fm.totalPrice == p.value
+                    && (fm.description.lowercased().contains(needle)
+                        || cleanedLower.contains(String(fm.description.lowercased().prefix(4))))
+            }
+            items.append(Receipt.LineItem(
+                description: cleaned,
+                quantity: fmMatch?.quantity,
+                unitPrice: fmMatch?.unitPrice,
+                totalPrice: p.value,
+                category: fmMatch?.category
+            ))
+        }
+
+        return items
+    }
+
     /// Three guards keep this conservative:
     ///   * a price column is only "established" if we already matched
     ///     at least two existing items' prices to OCR observations
@@ -998,24 +1352,43 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
 
         // Compute the price column from prices already matched to OCR.
-        // We DON'T `break` after the first match — when two items share
-        // the same price (e.g. two $6.99 items), both OCR observations
-        // need to land in matchedYs, otherwise the second one looks
-        // "unclaimed" to recovery and gets duplicated.
+        // Claim ONE OCR observation per extracted item. The set
+        // `claimedIdxs` ensures:
+        //   (a) When two items genuinely share a price (e.g. IMG_1260
+        //       has CHOBANI and LITL SMOKIES both at $6.99), each
+        //       claims a distinct OCR observation, so both Ys end up
+        //       in matchedYs and neither looks "unclaimed" later.
+        //   (b) When OCR prints a price more times than there are
+        //       items (e.g. IMG_1291 has 2 OCR rows of $3.50 but FM
+        //       only extracted 1 SIERRA NEVADA), the extras stay
+        //       unclaimed and recovery promotes them to new items.
         var matchedPriceXs: [Double] = []
         var matchedYs: [Double] = []
+        var claimedIdxs: Set<Int> = []
         for item in receipt.lineItems {
-            let amountStr = NSDecimalNumber(decimal: item.totalPrice).stringValue
-            for line in lines {
+            for (idx, line) in lines.enumerated() {
+                if claimedIdxs.contains(idx) { continue }
                 let trimmed = line.text.trimmingCharacters(in: .whitespaces)
                 guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
+                // Normalize the OCR text and parse it as Decimal so the
+                // comparison is numeric, not string. String comparison
+                // breaks on trailing zeros: "8.20" (OCR) ≠ "8.2"
+                // (NSDecimalNumber(decimal: 8.20).stringValue).
                 let normalized = trimmed
                     .replacingOccurrences(of: "$", with: "")
                     .replacingOccurrences(of: ",", with: ".")
+                    .replacingOccurrences(
+                        of: #"(\d)-(\d)"#,
+                        with: "$1.$2",
+                        options: .regularExpression
+                    )
                     .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
-                if normalized == amountStr {
+                guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
+                if v == item.totalPrice {
                     matchedPriceXs.append(line.box.x)
                     matchedYs.append(line.box.y + line.box.height / 2)
+                    claimedIdxs.insert(idx)
+                    break  // one OCR observation per item
                 }
             }
         }
@@ -1053,7 +1426,24 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // mid-receipt and skipped the first 3-4 items.
         let topSlack: Double = 0.18
         let bottomSlack: Double = 0.06
-        let bandLo = max(0.0, earliestY - topSlack)
+        // Also scan the OCR for the topmost price-shaped observation that
+        // sits in the established price column — that's almost always the
+        // first line item (multi-department receipts like Sprouts can
+        // have the first item at y≈0.12 while FM only emits items below
+        // y≈0.48, which `topSlack` alone can't bridge). The price-shape
+        // and column constraints already exclude header noise like store
+        // IDs or phone numbers.
+        let firstColumnPriceY: Double? = lines
+            .filter { columnRange.contains($0.box.x) }
+            .filter {
+                let t = $0.text.trimmingCharacters(in: .whitespaces)
+                return t.range(of: priceShape, options: .regularExpression) != nil
+            }
+            .map { $0.box.y + $0.box.height / 2 }
+            .min()
+        let slackLo = earliestY - topSlack
+        let columnLo = (firstColumnPriceY ?? earliestY) - 0.005
+        let bandLo = max(0.0, min(slackLo, columnLo))
         var bandHi = min(1.0, latestY + bottomSlack)
 
         // Snap bandHi up to the first "totals block" keyword we see at
@@ -1066,8 +1456,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             .filter { line in
                 let cY = line.box.y + line.box.height / 2
                 guard cY > latestY else { return false }
-                let lc = line.text.lowercased()
-                return totalsKeywords.contains(where: { lc.contains($0) })
+                return Self.lineLooksLikeTotalsBoundary(line.text, keywords: totalsKeywords)
             }
             .map { $0.box.y + $0.box.height / 2 }
             .min()
@@ -1106,10 +1495,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // we were pulling in observations from the row ABOVE (e.g. the
             // previous item's "Member Savings" line drifts into range for
             // the next item's price).
-            var leftCandidates: [(text: String, box: Receipt.BBox)] = []
+            var leftCandidates: [(text: String, box: Receipt.BBox, dy: Double)] = []
             for descLine in lines {
                 let cY = descLine.box.y + descLine.box.height / 2
-                guard abs(cY - centerY) <= max(0.008, priceLine.box.height * 0.7) else { continue }
+                let dy = abs(cY - centerY)
+                guard dy <= max(0.008, priceLine.box.height * 0.7) else { continue }
                 guard descLine.box.x < priceLine.box.x else { continue }
                 // Skip other price tokens.
                 let dt = descLine.text.trimmingCharacters(in: .whitespaces)
@@ -1117,21 +1507,24 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 // Skip very-short observations like a lone "L" tax marker —
                 // they're never the real product name.
                 guard dt.count >= 3 else { continue }
-                leftCandidates.append(descLine)
+                leftCandidates.append((descLine.text, descLine.box, dy))
             }
-            guard let descObs = leftCandidates.min(by: { $0.box.x < $1.box.x }) else { continue }
+            // Prefer the description with the smallest Y-difference to the
+            // price — they're on the SAME visual row. Falling back to
+            // "leftmost X" would happily pick a department header
+            // ("DAIRY", "PRODUCE") that sits at the same X column as the
+            // product names but on the row above. As a tiebreak when Ys
+            // are essentially identical, pick the leftmost X (the real
+            // description usually starts left of any inline metadata).
+            guard let descObs = leftCandidates.min(by: { a, b in
+                if abs(a.dy - b.dy) > 0.002 { return a.dy < b.dy }
+                return a.box.x < b.box.x
+            }) else { continue }
 
             let cleanedDesc = cleanLineItemDescription(descObs.text)
             guard cleanedDesc.count >= 3 else { continue }
             guard !isFooterRow(cleanedDesc) else { continue }
-            // Also drop if the description matches a metadata pattern
-            // ("Regular Price", "Member Savings", etc.). The pre-cluster
-            // metadata filter doesn't see this OCR row (we're scanning
-            // the raw lines), so it can leak through here.
-            let lcDesc = cleanedDesc.lowercased()
-            if Self.metadataLinePatterns.contains(where: {
-                lcDesc == $0 || lcDesc.hasPrefix($0 + " ")
-            }) { continue }
+            guard !Self.looksLikeNonItemRecoveryCandidate(cleanedDesc) else { continue }
 
             newItems.append(Receipt.LineItem(
                 description: cleanedDesc,
@@ -1148,6 +1541,272 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         return receipt
     }
 
+    /// Post-FM correction for items where the model chose the printed
+    /// regular price instead of the discounted actual price. Detected by:
+    ///   1. Finding the OCR row that contains the extracted price.
+    ///   2. Checking whether a "Regular Price" label observation sits on
+    ///      the same visual row as that price.
+    ///   3. If so: searching for an alternative price observation in the
+    ///      same X column, located ABOVE the description (smaller Y).
+    ///   4. Replacing the extracted price with the alternative.
+    ///
+    /// Conservative — only swaps when all three conditions are met, so
+    /// receipts that print only one price per item are untouched.
+    private static func correctRegularPriceMistakes(
+        receipt input: Receipt,
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt {
+        var receipt = input
+        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+
+        // Collect every "Regular Price" label Y-center.
+        let regularLabels: [Double] = lines.compactMap { line in
+            let lc = line.text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            let isLabel = [
+                "regular price", "resular price", "reqular price",
+                "recular price", "repular price", "reaular price",
+            ].contains { lc == $0 || lc.hasPrefix($0 + " ") }
+            return isLabel ? line.box.y + line.box.height / 2 : nil
+        }
+        guard !regularLabels.isEmpty else { return receipt }
+
+        // Helper: parse an OCR observation's text into a Decimal value
+        // if it's price-shaped, normalizing $, commas, trailing letter.
+        func priceValue(of line: (text: String, box: Receipt.BBox)) -> Decimal? {
+            let trimmed = line.text.trimmingCharacters(in: .whitespaces)
+            guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
+            let normalized = trimmed
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: ",", with: ".")
+                .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
+            return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
+        }
+
+        for i in 0..<receipt.lineItems.count {
+            let item = receipt.lineItems[i]
+            // Find the description's OCR row. Fuzzy match — receipt OCR
+            // can drop punctuation that FM preserves.
+            let descNeedle = item.description.lowercased().trimmingCharacters(in: .whitespaces)
+            let descWords = descNeedle
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count >= 3 }
+            var descY: Double? = nil
+            for line in lines {
+                let lc = line.text.lowercased()
+                let strict = lc.contains(descNeedle)
+                let fuzzy = !descWords.isEmpty && descWords.allSatisfy { lc.contains($0) }
+                if strict || fuzzy {
+                    descY = line.box.y + line.box.height / 2
+                    break
+                }
+            }
+            guard let descCenter = descY else { continue }
+
+            // Find the OCR observation matching the extracted price,
+            // closest in Y to the description (in case the value appears
+            // multiple times on the receipt).
+            var matchedPriceLineIdx: Int? = nil
+            var matchedPriceY: Double = 0
+            var matchedPriceX: Double = 0
+            var bestDy = Double.infinity
+            for (idx, line) in lines.enumerated() {
+                guard let v = priceValue(of: line), v == item.totalPrice else { continue }
+                let cy = line.box.y + line.box.height / 2
+                let dy = abs(cy - descCenter)
+                if dy < bestDy {
+                    bestDy = dy
+                    matchedPriceLineIdx = idx
+                    matchedPriceY = cy
+                    matchedPriceX = line.box.x
+                }
+            }
+            guard matchedPriceLineIdx != nil else { continue }
+
+            // Is the matched price's row adjacent to a "Regular Price"
+            // label? Tight tolerance — same visual row, not a neighbor.
+            let nearLabel = regularLabels.contains { abs($0 - matchedPriceY) <= 0.006 }
+            guard nearLabel else { continue }
+
+            // Look for an alternative price ABOVE the description in the
+            // same column. Must be smaller than the regular-price value
+            // (the whole point is that the actual is less than the
+            // regular).
+            var altPrice: Decimal? = nil
+            var altDistance = Double.infinity
+            for line in lines {
+                guard let v = priceValue(of: line) else { continue }
+                guard v > 0, v < item.totalPrice else { continue }
+                let cy = line.box.y + line.box.height / 2
+                guard cy < descCenter else { continue }
+                let dy = descCenter - cy
+                guard dy <= 0.014 else { continue }            // within ~2 line heights
+                guard abs(line.box.x - matchedPriceX) <= 0.05 else { continue }  // same column
+                if dy < altDistance {
+                    altDistance = dy
+                    altPrice = v
+                }
+            }
+            guard let alt = altPrice else { continue }
+            receipt.lineItems[i] = Receipt.LineItem(
+                description: item.description,
+                quantity: nil,
+                unitPrice: nil,
+                totalPrice: alt,
+                category: item.category
+            )
+        }
+        return receipt
+    }
+
+    /// Returns true if a single OCR observation looks like a real
+    /// totals-block label ("TAX", "SUBTOTAL", "**** BALANCE", "TAX 0.70")
+    /// — used to clamp the line-item recovery band so we don't accidentally
+    /// promote a row beneath the footer to a line item.
+    ///
+    /// The naive `lc.contains("tax")` approach catches false positives
+    /// like "SNGL TAX" (Safeway's single-tax category marker, which sits
+    /// inline with line items). Instead, tokenize the line and require
+    /// the keyword to be EITHER the first alphanumeric token OR the second
+    /// token preceded by a numeric one (handles "0.70 TAX"-style rows).
+    /// Asterisks / punctuation in the prefix ("**** BALANCE") fall away
+    /// because the split skips non-alphanumerics.
+    fileprivate static func lineLooksLikeTotalsBoundary(
+        _ text: String,
+        keywords: [String]
+    ) -> Bool {
+        let tokens = text.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+        guard let first = tokens.first else { return false }
+        for kw in keywords {
+            if first == kw { return true }
+            // Allow "0.70 TAX" — numeric first, keyword second. Use Double
+            // to accept both "0.70" and "0,70" (after a comma→dot pass).
+            if Double(first.replacingOccurrences(of: ",", with: ".")) != nil,
+               tokens.dropFirst().first == kw
+            {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Reject a description that the line-item recovery pass surfaced if
+    /// it's obviously not a product:
+    ///   * Department headers (LIQUOR, PRODUCE, DAIRY, …) — always one
+    ///     short uppercase word, often used as a section divider.
+    ///   * Coupon / rewards / savings lines — "forU Store Coupon 3.50-",
+    ///     "Grocery Rewards", "Member Savings", "Regular Price".
+    ///   * Lines whose text ends in a negative-discount price ("3.50-")
+    ///     — that's a savings amount, not a product.
+    ///   * SKU-style codes ("A031 10", "C1)") — short alphanumeric
+    ///     fragments that aren't real product names.
+    ///
+    /// The earlier `metadataLinePatterns` check only matched if the
+    /// True when MORE THAN HALF of a description's words are known
+    /// metadata fragments — used by the column-anchored description
+    /// picker to deprioritize candidates like "SNGL TAX" or "VOL+ WT"
+    /// in favor of real product names.
+    ///
+    /// Looser than `looksLikeNonItemRecoveryCandidate` (which rejects
+    /// outright): a description like "TAX FREE PRODUCT" has one noise
+    /// word out of three and stays through this check.
+    fileprivate static func descriptionIsMostlyNoise(_ text: String) -> Bool {
+        let noise: Set<String> = [
+            "tax", "vol", "vol+", "vol-", "info", "wt", "sngl",
+            "regular", "price", "savings", "saving", "member",
+            "rewards", "discount", "discounts", "additional",
+            "subtotal", "total", "balance", "change", "redeemed",
+            "produce", "dairy", "meat", "poultry", "deli", "bakery",
+            "grocery", "liquor", "wine", "beer", "frozen", "refrig",
+        ]
+        let words = text
+            .lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { !$0.isEmpty }
+        guard !words.isEmpty else { return false }
+        let noiseCount = words.filter { noise.contains($0) }.count
+        return Double(noiseCount) > Double(words.count) * 0.5
+    }
+
+    /// pattern was a prefix of the line. Garbled Vision output like
+    /// "23MMember Savings Ta 18.00-" (the `23M` is a SKU prefix the OCR
+    /// merged onto the savings row) defeats prefix matching, so this
+    /// helper checks substrings.
+    fileprivate static func looksLikeNonItemRecoveryCandidate(_ description: String) -> Bool {
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lc = trimmed.lowercased()
+
+        // Common department headers — these print on their own row and
+        // get picked up if a price observation lands in the same band.
+        let departments: Set<String> = [
+            "grocery", "produce", "dairy", "meat", "poultry", "seafood",
+            "deli", "bakery", "frozen", "refrig", "refrig/frozen",
+            "gen merchandise", "general merchandise", "merchandise",
+            "liquor", "wine", "beer", "bulk", "household", "pharmacy",
+            "health", "beauty", "snacks", "beverages",
+        ]
+        if departments.contains(lc) { return true }
+
+        // Single-word metadata fragments — leftovers after Vision split
+        // "Member Savings" / "Regular Price" / "Additional Discounts"
+        // into two observations and one half slipped through filtering.
+        // None of these are plausible standalone product names.
+        let metadataFragments: Set<String> = [
+            "member", "regular", "savings", "discounts", "discount",
+            "rewards", "coupon", "additional", "balance", "subtotal",
+            "tax", "tip", "total", "change", "redeemed",
+            // Safeway-specific column markers — appear in the price
+            // column area at random Ys and confuse recovery.
+            "vol", "vol+", "vol-", "wt", "info",
+        ]
+        if metadataFragments.contains(lc) { return true }
+
+        // Multi-word footer phrases.
+        let footerPhrases: [String] = [
+            "additional discounts",
+            "additional discount",
+            "instant savings",
+            "promo savings",
+        ]
+        if footerPhrases.contains(where: { lc.contains($0) }) { return true }
+
+        // Coupon / savings / loyalty / rewards anywhere in the text.
+        // These phrases never appear inside a real product name.
+        let nonItemSubstrings: [String] = [
+            "store coupon", "manufacturer coupon", "mfr coupon",
+            "member savings", "member saving", "member savinas",
+            "regular price", "resular price", "reqular price",
+            "for personalized", "forl personalized",
+            "you save", "you saved",
+            "grocery rewards", "rewards earned", "points earned",
+            "loyalty discount",
+        ]
+        for sub in nonItemSubstrings {
+            if lc.contains(sub) { return true }
+        }
+
+        // Trailing negative-amount marker ("3.50-", "18.00-") — that's a
+        // savings line, not a product.
+        if trimmed.range(of: #"\d+[.,]\d{1,2}\s*-\s*$"#, options: .regularExpression) != nil {
+            return true
+        }
+
+        // SKU-style code: starts with one or two letters, then a run of
+        // digits, optionally followed by spaces and more digits. "A031 10"
+        // is the canonical example; "C1)" similar shape.
+        if trimmed.range(
+            of: #"^[A-Z]{1,2}\d{2,}([ )]+\d+)?\s*$"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+
+        return false
+    }
+
     /// Find the OCR row whose text matches `description` (substring or
     /// any 3+-char word from it), then return the largest price-shaped
     /// token in that row. Used by the FM-output sanity check to compare
@@ -1156,51 +1815,68 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         matching description: String,
         in lines: [(text: String, box: Receipt.BBox)]
     ) -> Decimal? {
+        // Returns the first matching row's rightmost price. Kept as a
+        // single-row convenience; for the OCR-anchored correction we
+        // want EVERY occurrence, so callers should prefer
+        // `rightmostPricesInOCRRows` below.
+        rightmostPricesInOCRRows(matching: description, in: lines).first
+    }
+
+    /// Every distinct rightmost-price token from each OCR row that
+    /// matches `description`. Used by the OCR-anchored price
+    /// correction: when a receipt has two items with the same name
+    /// (e.g. "BONE-IN CHCKN THIGHS 5.53" and "BONE-IN CHCKN THIGHS 6.03"),
+    /// FM sometimes collapses them into one item with quantity=2 and
+    /// totalPrice=11.06. To detect that we need to see ALL the printed
+    /// prices, not just the first row's.
+    private static func rightmostPricesInOCRRows(
+        matching description: String,
+        in lines: [(text: String, box: Receipt.BBox)]
+    ) -> [Decimal] {
         let needle = description.lowercased().trimmingCharacters(in: .whitespaces)
-        guard !needle.isEmpty else { return nil }
+        guard !needle.isEmpty else { return [] }
         let words = needle
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .map(String.init)
             .filter { $0.count >= 3 }
 
-        // Find candidate OCR observations whose text references this item.
-        var matchingY: Double? = nil
+        // Find every OCR observation whose text references this item.
+        var rowYs: [Double] = []
         for line in lines {
             let lc = line.text.lowercased()
             let strict = lc.contains(needle)
             let fuzzy = !words.isEmpty && words.allSatisfy { lc.contains($0) }
             if strict || fuzzy {
-                matchingY = line.box.y + line.box.height / 2
-                break
+                rowYs.append(line.box.y + line.box.height / 2)
             }
         }
-        guard let y = matchingY else { return nil }
+        guard !rowYs.isEmpty else { return [] }
 
-        // Scan all observations on roughly the same row, grab any
-        // price-shaped tokens, return the rightmost. Allow an optional
-        // trailing single-letter tax marker ("2.99 S") since the OCR
-        // observations we receive here are the *raw* Vision output,
-        // before stripTrailingTaxMarkers runs.
         let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
-        var best: (price: Decimal, x: Double)? = nil
-        for line in lines {
-            let centerY = line.box.y + line.box.height / 2
-            // Generous tolerance — Y can vary by ~1.5x line height when
-            // a row's price sits slightly above/below the description.
-            guard abs(centerY - y) <= max(0.015, line.box.height * 1.5) else { continue }
-            let trimmed = line.text.trimmingCharacters(in: .whitespaces)
-            guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
-            // Normalize commas, strip $ and any trailing tax marker.
-            let stripped = trimmed
-                .replacingOccurrences(of: "$", with: "")
-                .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
-            guard let value = Decimal(string: stripped, locale: Locale(identifier: "en_US_POSIX")) else { continue }
-            if best == nil || line.box.x > best!.x {
-                best = (value, line.box.x)
+        var out: [Decimal] = []
+        for rowY in rowYs {
+            // Tight tolerance — we want THIS row's price, not a neighbor's.
+            // 0.7 × line-height typically keeps us inside a single OCR row
+            // even when the description and price sit on slightly different
+            // baselines.
+            var best: (price: Decimal, x: Double)? = nil
+            for line in lines {
+                let centerY = line.box.y + line.box.height / 2
+                guard abs(centerY - rowY) <= max(0.008, line.box.height * 0.7) else { continue }
+                let trimmed = line.text.trimmingCharacters(in: .whitespaces)
+                guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
+                let stripped = trimmed
+                    .replacingOccurrences(of: "$", with: "")
+                    .replacingOccurrences(of: ",", with: ".")
+                    .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
+                guard let value = Decimal(string: stripped, locale: Locale(identifier: "en_US_POSIX")) else { continue }
+                if best == nil || line.box.x > best!.x {
+                    best = (value, line.box.x)
+                }
             }
+            if let b = best { out.append(b.price) }
         }
-        return best?.price
+        return out
     }
 
     /// Trailing tokens that are typically tax-category indicators on US
@@ -1272,7 +1948,16 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// lowercased and trimmed, equals one of these or starts with one
     /// followed by a space / colon / dash.
     private static let metadataLinePatterns: [String] = [
+        // "regular price" plus Vision OCR misreads of the 'g' (small
+        // fonts substitute s/q/c/p for g routinely). Without these
+        // variants, lines like "Resular Price 6.99" leak through the
+        // metadata filter and FM treats them as line items.
         "regular price",
+        "resular price",
+        "reqular price",
+        "recular price",
+        "repular price",
+        "reaular price",
         // "member savings" plus common Vision OCR misreads of "savings"
         // — letters get substituted on small fonts. Without these typo
         // variants, the misread row leaks into the FM prompt and the
@@ -1330,13 +2015,25 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     fileprivate static func normalizePriceTokens(
         _ lines: [(text: String, box: Receipt.BBox)]
     ) -> [(text: String, box: Receipt.BBox)] {
-        let pattern = #"(\d+)-(\d{2})\b"#
+        // (1) Hyphen-misread for the decimal point ("$11-75" → "$11.75").
+        let hyphenPattern = #"(\d+)-(\d{2})\b"#
+        // (2) Spurious whitespace after the decimal ("6. 49" → "6.49").
+        // Vision sometimes splits the digit pair on small fonts; without
+        // closing the gap, the row is no longer price-shaped and the
+        // item silently disappears from extraction.
+        let spaceAfterDotPattern = #"(\d)\.\s+(\d{2})\b"#
         return lines.map { line in
-            let normalized = line.text.replacingOccurrences(
-                of: pattern,
-                with: "$1.$2",
-                options: .regularExpression
-            )
+            let normalized = line.text
+                .replacingOccurrences(
+                    of: hyphenPattern,
+                    with: "$1.$2",
+                    options: .regularExpression
+                )
+                .replacingOccurrences(
+                    of: spaceAfterDotPattern,
+                    with: "$1.$2",
+                    options: .regularExpression
+                )
             return (text: normalized, box: line.box)
         }
     }
@@ -1365,7 +2062,23 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     fileprivate static func dropMetadataObservations(
         _ lines: [(text: String, box: Receipt.BBox)]
     ) -> [(text: String, box: Receipt.BBox)] {
-        lines.filter { line in
+        // Substring-match patterns: drop the whole observation if its
+        // text *contains* one of these, no matter the prefix. Catches
+        // garbled OCR like "23MMember Savings Ta 18.00-" (a savings row
+        // with a SKU "23M" merged onto the start) and "forU Store
+        // Coupon 3.50-" where a prefix-only match would miss it because
+        // "foru" isn't in `metadataLinePatterns`. These phrases never
+        // appear inside a real product name.
+        let dropIfContains: [String] = [
+            "store coupon", "manufacturer coupon", "mfr coupon",
+            "member savings", "member saving",
+            "member savinas", "member savinos", "member savincs",
+            "for personalized", "forl personalized",
+            "you save", "you saved",
+            "grocery rewards", "rewards earned", "points earned",
+            "loyalty discount",
+        ]
+        return lines.filter { line in
             let lc = line.text
                 .lowercased()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1375,6 +2088,9 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 if lc.hasPrefix(pat + " ") { return false }
                 if lc.hasPrefix(pat + ":") { return false }
                 if lc.hasPrefix(pat + "-") { return false }
+            }
+            if dropIfContains.contains(where: { lc.contains($0) }) {
+                return false
             }
             return true
         }
@@ -1464,6 +2180,42 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// "savings amount" rows left behind when their label sibling was
     /// pruned by `dropMetadataObservations` — including them would tempt
     /// the LLM to invent extra line items.
+    /// True when a clustered row's joined text contains one of the
+    /// "hard" discount/metadata markers ("Regular Price",
+    /// "Member Savings", "for Personalized", "Store Coupon"). The row
+    /// always carries a price sibling (the regular-price amount or the
+    /// savings amount), so FM will mistake the row for an item if we
+    /// don't drop the whole thing here.
+    ///
+    /// Distinct from `dropMetadataObservations`, which filters individual
+    /// observations BEFORE clustering. That pass only catches lines
+    /// where the metadata text is the entire observation; clustering can
+    /// still glue the surviving price observation onto a different row
+    /// containing the marker. This is the post-cluster safety net.
+    fileprivate static func rowContainsHardMetadataMarker(_ row: OCRRow) -> Bool {
+        // Strip punctuation and collapse whitespace so "Regular, Price"
+        // (comma artifact) still matches "regular price". Without this
+        // normalization, Vision's per-character OCR for low-quality
+        // receipts inserts commas/dots/spaces inside multi-word labels
+        // and our markers slip past.
+        let rawLc = row.joined.lowercased()
+        let collapsed = rawLc
+            .replacingOccurrences(of: #"[^a-z0-9 ]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #" +"#, with: " ", options: .regularExpression)
+        let markers: [String] = [
+            "regular price", "resular price", "reqular price",
+            "recular price", "repular price", "reaular price",
+            "member savings", "member saving",
+            "member savinas", "member savinos", "member savincs",
+            "for personalized", "forl personalized",
+            "store coupon", "manufacturer coupon", "mfr coupon",
+            "you save", "you saved",
+            "rewards earned", "grocery rewards", "points earned",
+            "loyalty discount",
+        ]
+        return markers.contains { collapsed.contains($0) }
+    }
+
     fileprivate static func isOrphanedNumericRow(_ row: OCRRow) -> Bool {
         let segments = row.segments
         guard !segments.isEmpty else { return true }
