@@ -211,6 +211,44 @@ struct ReceiptFormSection: View {
                         .frame(maxWidth: 90, alignment: .leading)
                 }
                 LabeledFieldRow(
+                    label: "Subtotal",
+                    showBadge: draft.isPreLabel,
+                    edited: draft.subtotalWasEdited,
+                    confidence: draft.basis.provenance.fieldConfidence["totals.subtotal"],
+                    bboxKey: "totals.subtotal",
+                    selectedKey: $draft.selectedBBoxKey
+                ) {
+                    TextField("0.00", value: optionalDecimalBinding(\.subtotal), format: .number.precision(.fractionLength(0...2)))
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+            HStack(alignment: .top, spacing: 12) {
+                LabeledFieldRow(
+                    label: "Tax",
+                    showBadge: draft.isPreLabel,
+                    edited: draft.taxWasEdited,
+                    confidence: draft.basis.provenance.fieldConfidence["totals.tax"],
+                    bboxKey: "totals.tax",
+                    selectedKey: $draft.selectedBBoxKey
+                ) {
+                    TextField("0.00", value: optionalDecimalBinding(\.tax), format: .number.precision(.fractionLength(0...2)))
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                }
+                LabeledFieldRow(
+                    label: "Tip",
+                    showBadge: draft.isPreLabel,
+                    edited: draft.tipWasEdited,
+                    confidence: draft.basis.provenance.fieldConfidence["totals.tip"],
+                    bboxKey: "totals.tip",
+                    selectedKey: $draft.selectedBBoxKey
+                ) {
+                    TextField("0.00", value: optionalDecimalBinding(\.tip), format: .number.precision(.fractionLength(0...2)))
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                }
+                LabeledFieldRow(
                     label: "Total",
                     showBadge: draft.isPreLabel,
                     edited: draft.totalWasEdited,
@@ -218,12 +256,23 @@ struct ReceiptFormSection: View {
                     bboxKey: "totals.total",
                     selectedKey: $draft.selectedBBoxKey
                 ) {
-                    TextField("0.00", value: $draft.total, format: .number.precision(.fractionLength(2)))
+                    TextField("0.00", value: $draft.total, format: .number.precision(.fractionLength(0...2)))
                         .textFieldStyle(.roundedBorder)
                         .multilineTextAlignment(.trailing)
                 }
             }
         }
+    }
+
+    /// Bridge a TextField's non-optional `value:` binding to an optional
+    /// Decimal property on `draft`. We treat a typed 0 as "user wants to
+    /// keep 0 as the value" (some receipts legitimately have $0.00 tax);
+    /// the empty-field state maps to nil via the formatter.
+    private func optionalDecimalBinding(_ keyPath: ReferenceWritableKeyPath<LabelDraft, Decimal?>) -> Binding<Decimal> {
+        Binding(
+            get: { draft[keyPath: keyPath] ?? 0 },
+            set: { draft[keyPath: keyPath] = $0 }
+        )
     }
 
     // MARK: - Vendor picker
@@ -405,6 +454,8 @@ struct ReceiptFormSection: View {
         case "date.value":        return "Date"
         case "totals.total":      return "Total"
         case "totals.subtotal":   return "Subtotal"
+        case "totals.tax":        return "Tax"
+        case "totals.tip":        return "Tip"
         case let k where k.hasPrefix("lineItem."):
             // lineItem.005 → "Line item #5"
             // lineItem.005.price → "Line item #5 — price"
@@ -636,7 +687,7 @@ private struct LineItemRow: View {
                 ) {
                     HStack(spacing: 4) {
                         Text("$").foregroundStyle(.secondary)
-                        TextField("Total", value: $item.totalPrice, format: .number.precision(.fractionLength(2)))
+                        TextField("Total", value: $item.totalPrice, format: .number.precision(.fractionLength(0...2)))
                             .frame(maxWidth: 100)
                             .textFieldStyle(.roundedBorder)
                             .multilineTextAlignment(.trailing)

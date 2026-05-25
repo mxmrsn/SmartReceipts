@@ -71,6 +71,12 @@ struct BoundingBoxOverlay: View {
         if let b = bboxes["totals.subtotal"] {
             out.append(ClaimedItem(id: "subtotal", bboxKey: "totals.subtotal", label: "Subtotal", color: .purple, bbox: b))
         }
+        if let b = bboxes["totals.tax"] {
+            out.append(ClaimedItem(id: "tax", bboxKey: "totals.tax", label: "Tax", color: .pink, bbox: b))
+        }
+        if let b = bboxes["totals.tip"] {
+            out.append(ClaimedItem(id: "tip", bboxKey: "totals.tip", label: "Tip", color: .mint, bbox: b))
+        }
         if let b = bboxes["totals.total"] {
             out.append(ClaimedItem(id: "total", bboxKey: "totals.total", label: "Total", color: .red, bbox: b))
         }
@@ -192,9 +198,13 @@ private struct ClaimedBoxView: View {
     // MARK: - Body translate gesture
 
     private var translateGesture: some Gesture {
-        DragGesture(minimumDistance: 3)
+        // minimumDistance: 0 so the box tracks the cursor immediately
+        // on mouse-down with no "dead zone". A click without any motion
+        // fires onChanged once with translation = .zero, onEnded with
+        // translation = .zero — the bbox stays put and onSelect fires,
+        // so it doubles as a click-to-select.
+        DragGesture(minimumDistance: 0)
             .onChanged { value in
-                // Auto-select on drag start so first move always works
                 if !isSelected { onSelect() }
                 dragOffset = value.translation
             }
@@ -306,6 +316,8 @@ private struct OCRLineButton: View {
             assignButton("Set as Date", systemImage: "calendar", color: .green) { onAssign(.date) }
             assignButton("Set as Total", systemImage: "creditcard", color: .red) { onAssign(.total) }
             assignButton("Set as Subtotal", systemImage: "minus.circle", color: .purple) { onAssign(.subtotal) }
+            assignButton("Set as Tax", systemImage: "percent", color: .pink) { onAssign(.tax) }
+            assignButton("Set as Tip", systemImage: "dollarsign.arrow.circlepath", color: .mint) { onAssign(.tip) }
             Divider()
             assignButton("Add as line item", systemImage: "plus", color: .orange) { onAssign(.lineItem) }
         }

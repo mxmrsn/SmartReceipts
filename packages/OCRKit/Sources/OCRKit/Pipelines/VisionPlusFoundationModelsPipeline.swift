@@ -507,17 +507,82 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
            let box = locateBBox(amount: subtotal, in: lines, requireKeyword: "subtotal") {
             bboxes["totals.subtotal"] = box
         }
-        // Line items: walk in order, find first match per row that we haven't claimed yet.
+        // Tax: pick the OCR line containing the keyword "tax" near the
+        // bottom of the receipt. Most receipts have exactly one tax line;
+        // we attach the bbox to the first tax entry.
+        if let firstTax = receipt.totals.tax.first,
+           let box = locateBBox(amount: firstTax.amount, in: lines, requireKeyword: "tax") {
+            bboxes["totals.tax"] = box
+        }
+        // Tip: similar pattern. Restaurant receipts show this; grocery
+        // receipts don't. locateBBox(amount:requireKeyword:) already
+        // prefers the price-column observation over the label observation.
+        if let tip = receipt.totals.tip,
+           let box = locateBBox(amount: tip, in: lines, requireKeyword: "tip") {
+            bboxes["totals.tip"] = box
+        }
+
+        // Line items: for each item, find the description's OCR line, then
+        // *also* find a separate OCR line on the same visual row that
+        // matches the totalPrice. The labeler renders the description bbox
+        // (yellow) and price bbox (orange) independently so the user can
+        // adjust either without disturbing the other.
         var claimed = Set<Int>()
         for (idx, item) in receipt.lineItems.enumerated() {
-            if let (lineIdx, box) = locateItemBBox(description: item.description, totalPrice: item.totalPrice, in: lines, excluding: claimed) {
-                bboxes["lineItem.\(String(format: "%03d", idx))"] = box
-                claimed.insert(lineIdx)
+            guard let (descLineIdx, descBox) = locateItemBBox(
+                description: item.description,
+                totalPrice: item.totalPrice,
+                in: lines,
+                excluding: claimed
+            ) else { continue }
+            let key = String(format: "lineItem.%03d", idx)
+            bboxes[key] = descBox
+            claimed.insert(descLineIdx)
+            if let (priceLineIdx, priceBox) = locateItemPriceBBox(
+                amount: item.totalPrice,
+                nearY: descBox.y + descBox.height / 2,
+                rowHeight: descBox.height,
+                in: lines,
+                excluding: claimed
+            ) {
+                bboxes["\(key).price"] = priceBox
+                claimed.insert(priceLineIdx)
             }
         }
 
         receipt.provenance.bboxes = bboxes
         return receipt
+    }
+
+    /// Find an OCR line on the same visual row as a line-item description
+    /// whose text contains the `amount` — that's the price column. We
+    /// prefer the rightmost candidate (price columns are at the right
+    /// edge) and require the Y center to be within ~1.5 row-heights of
+    /// the description's Y center so we don't grab a number from a
+    /// completely different row.
+    private static func locateItemPriceBBox(
+        amount: Decimal,
+        nearY: Double,
+        rowHeight: Double,
+        in lines: [(text: String, box: Receipt.BBox)],
+        excluding: Set<Int>
+    ) -> (lineIndex: Int, box: Receipt.BBox)? {
+        let amountStr = NSDecimalNumber(decimal: amount).stringValue
+        let tolerance = max(0.01, rowHeight * 1.5)
+        var best: (idx: Int, box: Receipt.BBox)? = nil
+        for (idx, line) in lines.enumerated() {
+            if excluding.contains(idx) { continue }
+            let centerY = line.box.y + line.box.height / 2
+            guard abs(centerY - nearY) <= tolerance else { continue }
+            // Match either the exact value, or a price-shaped substring
+            // that contains the amount (handles "8.49 S" → "8.49").
+            guard line.text.contains(amountStr) else { continue }
+            // Prefer the rightmost qualifying line (highest x).
+            if best == nil || line.box.x > best!.box.x {
+                best = (idx, line.box)
+            }
+        }
+        return best.map { ($0.idx, $0.box) }
     }
 
     /// Use Apple's NSDataDetector to find any date-shaped text in the OCR
@@ -588,18 +653,48 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         in lines: [(text: String, box: Receipt.BBox)],
         requireKeyword: String
     ) -> Receipt.BBox? {
-        let amountStr = NSDecimalNumber(decimal: amount)
-            .stringValue
-        // Pick a line that mentions the keyword AND contains the amount text.
-        // Search bottom-up since totals are at the bottom.
+        let amountStr = NSDecimalNumber(decimal: amount).stringValue
+        let keyword = requireKeyword.lowercased()
+
+        // Case 1: same OCR observation contains BOTH the keyword and the
+        // amount (e.g. "TOTAL  60.99" as a single line). Use the whole
+        // line — there's only one observation to point at.
         for line in lines.reversed() {
             let lc = line.text.lowercased()
-            if lc.contains(requireKeyword), line.text.contains(amountStr) {
+            if lc.contains(keyword), line.text.contains(amountStr) {
                 return line.box
             }
         }
-        // Fallback: any line with the keyword
-        return lines.reversed().first(where: { $0.text.lowercased().contains(requireKeyword) })?.box
+
+        // Case 2: keyword and amount are on separate OCR observations on
+        // the same printed row (e.g. "TOTAL" left column, "60.99" right
+        // column). Prefer the amount-containing observation — that's the
+        // price the user wants the bbox on, not the word label. Tie-break
+        // by picking the rightmost candidate so we always land on the
+        // price column rather than e.g. a "subtotal" word elsewhere.
+        let keywordRows = lines
+            .filter { $0.text.lowercased().contains(keyword) }
+            .map { (y: $0.box.y + $0.box.height / 2, h: $0.box.height) }
+        if !keywordRows.isEmpty {
+            var best: (box: Receipt.BBox, x: Double)? = nil
+            for amountLine in lines where amountLine.text.contains(amountStr) {
+                let amountY = amountLine.box.y + amountLine.box.height / 2
+                // Same visual row as one of the keyword observations?
+                let onSameRow = keywordRows.contains { kw in
+                    let tol = max(amountLine.box.height, kw.h) * 1.2
+                    return abs(amountY - kw.y) <= tol
+                }
+                guard onSameRow else { continue }
+                if best == nil || amountLine.box.x > best!.x {
+                    best = (amountLine.box, amountLine.box.x)
+                }
+            }
+            if let best { return best.box }
+        }
+
+        // Case 3: no amount on a keyword row — fall back to any keyword
+        // line (last resort, will outline the label itself).
+        return lines.reversed().first(where: { $0.text.lowercased().contains(keyword) })?.box
     }
 
     private static func locateItemBBox(

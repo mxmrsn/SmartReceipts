@@ -226,6 +226,32 @@ struct ZoomableImageView<Overlay: View>: View {
         userZoomed = true
     }
 
+    /// Where the image's top-left sits in scroll-content coordinates at a
+    /// given zoom. When the image+padding is SMALLER than the viewport the
+    /// outer `.frame(minWidth:alignment: .center)` centers the image, so
+    /// the origin sits at `(viewport - image*zoom)/2` instead of just at
+    /// `(imagePadding)`. As zoom grows past the threshold the centering
+    /// disappears and the origin jumps to `(imagePadding)`. Without
+    /// compensating for that jump in the zoom math, a focal point under
+    /// the cursor visibly drifts toward the left edge while crossing the
+    /// threshold — the "shifts left" behavior the user was seeing.
+    private func imageOrigin(at z: CGFloat) -> CGPoint {
+        guard let image, containerSize.width > 0, containerSize.height > 0 else {
+            return CGPoint(x: imagePadding, y: imagePadding)
+        }
+        let scaledW = image.size.width * z
+        let scaledH = image.size.height * z
+        let contentW = scaledW + 2 * imagePadding
+        let contentH = scaledH + 2 * imagePadding
+        let x: CGFloat = contentW < containerSize.width
+            ? (containerSize.width - scaledW) / 2
+            : imagePadding
+        let y: CGFloat = contentH < containerSize.height
+            ? (containerSize.height - scaledH) / 2
+            : imagePadding
+        return CGPoint(x: x, y: y)
+    }
+
     /// Two-finger pinch on the trackpad. We snapshot zoom + scroll + focal
     /// point once on the gesture's first frame, then on each subsequent
     /// frame compute the new zoom and the new scroll offset *as absolute
@@ -254,13 +280,20 @@ struct ZoomableImageView<Overlay: View>: View {
 
                 let newZoom = (pinchStartZoom * value.magnification)
                     .clamped(to: minZoom...maxZoom)
+                // Compute origins BEFORE mutating zoom (newOrigin uses the
+                // about-to-be-current zoom value, oldOrigin uses the
+                // gesture-start snapshot).
+                let oldOrigin = imageOrigin(at: pinchStartZoom)
+                let newOrigin = imageOrigin(at: newZoom)
                 zoom = newZoom
                 userZoomed = true
 
                 // Keep the focal point's screen position fixed across the
-                // whole gesture: new scroll = start scroll + focal * Δzoom.
-                let dx = pinchStartFocal.x * (newZoom - pinchStartZoom)
-                let dy = pinchStartFocal.y * (newZoom - pinchStartZoom)
+                // whole gesture, including any centered→top-left layout
+                // shift that crosses the viewport-width threshold:
+                //   newScroll = startScroll + (newOrigin − oldOrigin) + focal * Δzoom
+                let dx = (newOrigin.x - oldOrigin.x) + pinchStartFocal.x * (newZoom - pinchStartZoom)
+                let dy = (newOrigin.y - oldOrigin.y) + pinchStartFocal.y * (newZoom - pinchStartZoom)
                 scrollPosition.scrollTo(point: CGPoint(
                     x: pinchStartScroll.x + dx,
                     y: pinchStartScroll.y + dy
@@ -292,11 +325,17 @@ struct ZoomableImageView<Overlay: View>: View {
         let oldZoom = zoom
         let clamped = newZoom.clamped(to: minZoom...maxZoom)
         guard clamped != oldZoom else { return }
+        // Snapshot the image origin BEFORE updating zoom — origin depends
+        // on the current zoom via the centering rule in imageOrigin(at:).
+        let oldOrigin = imageOrigin(at: oldZoom)
+        let newOrigin = imageOrigin(at: clamped)
         zoom = clamped
 
         guard let hover = hoverInImage else { return }
-        let dx = hover.x * (clamped - oldZoom)
-        let dy = hover.y * (clamped - oldZoom)
+        // newScroll = oldScroll + (newOrigin − oldOrigin) + focal * Δzoom
+        // The origin term compensates for the centered→top-left layout shift.
+        let dx = (newOrigin.x - oldOrigin.x) + hover.x * (clamped - oldZoom)
+        let dy = (newOrigin.y - oldOrigin.y) + hover.y * (clamped - oldZoom)
         let target = CGPoint(
             x: currentScrollOffset.x + dx,
             y: currentScrollOffset.y + dy

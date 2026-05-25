@@ -22,6 +22,18 @@ final class LabelDraft {
     var merchantName: String
     var receiptDate: Date
     var total: Decimal
+    /// Subtotal (pre-tax). Optional — receipts without a separate subtotal
+    /// line legitimately omit it.
+    var subtotal: Decimal?
+    /// First tax line's amount, surfaced as a single editable field.
+    /// Multi-tax receipts (state + city + restaurant tax) are rare in
+    /// practice; we use the schema's `tax: [TaxLine]` array but only
+    /// expose one slot here. The canonical Receipt keeps any additional
+    /// tax lines round-tripped through `basis`.
+    var tax: Decimal?
+    /// Tip amount. Only shows up on restaurant / service receipts; nil
+    /// when absent so the form treats the field as "not present".
+    var tip: Decimal?
     var currency: String
     var lineItems: [LineItemDraft]
     var status: LabelStatus
@@ -69,6 +81,9 @@ final class LabelDraft {
         self.merchantName = r.header.merchant.name
         self.receiptDate = LabelDraft.parseISODate(r.header.date.value) ?? Date()
         self.total = r.totals.total
+        self.subtotal = r.totals.subtotal
+        self.tax = r.totals.tax.first?.amount
+        self.tip = r.totals.tip
         self.currency = r.header.currency
         self.lineItems = r.lineItems.map { LineItemDraft(from: $0) }
         self.status = document.label.status
@@ -117,6 +132,9 @@ final class LabelDraft {
         self.merchantName = receipt.header.merchant.name
         self.receiptDate = LabelDraft.parseISODate(receipt.header.date.value) ?? Date()
         self.total = receipt.totals.total
+        self.subtotal = receipt.totals.subtotal
+        self.tax = receipt.totals.tax.first?.amount
+        self.tip = receipt.totals.tip
         self.currency = receipt.header.currency
         self.lineItems = receipt.lineItems.map { LineItemDraft(from: $0) }
         self.status = .draft
@@ -159,6 +177,9 @@ final class LabelDraft {
     var merchantWasEdited: Bool { merchantName != basis.header.merchant.name }
     var dateWasEdited: Bool { LabelDraft.formatISODate(receiptDate) != basis.header.date.value }
     var totalWasEdited: Bool { total != basis.totals.total }
+    var subtotalWasEdited: Bool { subtotal != basis.totals.subtotal }
+    var taxWasEdited: Bool { tax != basis.totals.tax.first?.amount }
+    var tipWasEdited: Bool { tip != basis.totals.tip }
     var currencyWasEdited: Bool { currency != basis.header.currency }
     var lineItemsWereEdited: Bool {
         if lineItems.count != basis.lineItems.count { return true }
@@ -231,6 +252,8 @@ final class LabelDraft {
         case date
         case total
         case subtotal
+        case tax
+        case tip
         case lineItem
 
         /// The bbox key this target writes to (for non-lineItem cases).
@@ -240,6 +263,8 @@ final class LabelDraft {
             case .date:     return "date.value"
             case .total:    return "totals.total"
             case .subtotal: return "totals.subtotal"
+            case .tax:      return "totals.tax"
+            case .tip:      return "totals.tip"
             case .lineItem: return nil  // dynamic index, computed at assignment time
             }
         }
@@ -414,7 +439,20 @@ final class LabelDraft {
             }
             bboxOverrides["totals.total"] = line.box
         case .subtotal:
+            if let amount = LabelDraft.parseAmount(line.text) {
+                subtotal = amount
+            }
             bboxOverrides["totals.subtotal"] = line.box
+        case .tax:
+            if let amount = LabelDraft.parseAmount(line.text) {
+                tax = amount
+            }
+            bboxOverrides["totals.tax"] = line.box
+        case .tip:
+            if let amount = LabelDraft.parseAmount(line.text) {
+                tip = amount
+            }
+            bboxOverrides["totals.tip"] = line.box
         case .lineItem:
             // Best-effort: extract description + price from one line, append
             // as a new line item with its bbox riding on the draft itself.
@@ -439,6 +477,25 @@ final class LabelDraft {
         receipt.header.date = OCRKit.Receipt.ReceiptDate(value: LabelDraft.formatISODate(receiptDate))
         receipt.header.currency = currency
         receipt.totals.total = total
+        receipt.totals.subtotal = subtotal
+        // Map the single editable `tax` field back to the schema's tax
+        // array. Preserve any non-first tax entries from basis (multi-tax
+        // receipts) so we don't drop them on save.
+        if let amount = tax {
+            let label = basis.totals.tax.first?.label ?? "Tax"
+            let rate = basis.totals.tax.first?.rate
+            var taxLines = basis.totals.tax
+            if taxLines.isEmpty {
+                taxLines = [OCRKit.Receipt.TaxLine(label: label, rate: rate, amount: amount)]
+            } else {
+                taxLines[0] = OCRKit.Receipt.TaxLine(label: label, rate: rate, amount: amount)
+            }
+            receipt.totals.tax = taxLines
+        } else {
+            // User cleared the tax field — drop the first entry, keep extras.
+            receipt.totals.tax = Array(basis.totals.tax.dropFirst())
+        }
+        receipt.totals.tip = tip
         receipt.lineItems = lineItems.map { $0.asCanonical }
         receipt.provenance.bboxes = effectiveBBoxes
 
