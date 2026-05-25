@@ -21,8 +21,41 @@ struct ZoomableImageView<Overlay: View>: View {
     /// when navigating to a new URL.
     @State private var userZoomed: Bool = false
 
+    /// Programmatic scroll offset for the underlying ScrollView. We update
+    /// this when zooming so the point under the cursor stays under the cursor.
+    @State private var scrollPosition = ScrollPosition(x: 0, y: 0)
+    /// The latest scroll offset reported by `onScrollGeometryChange`. We need
+    /// to read it to compute the delta when zooming around the cursor.
+    @State private var currentScrollOffset: CGPoint = .zero
+    /// Where the mouse currently is, in *image-natural* coordinates
+    /// (before zoom is applied). Set/cleared by `onContinuousHover` on the
+    /// image. Used as the focal point when the user changes zoom.
+    @State private var hoverInImage: CGPoint? = nil
+    /// Snapshot of `zoom` at the moment a pinch gesture began. Each
+    /// MagnifyGesture event reports `magnification` as the *total* scale
+    /// since gesture start, so we need a stable baseline to multiply against.
+    @State private var pinchStartZoom: CGFloat = 1.0
+    /// Snapshot of the live scroll offset at gesture start. We anchor every
+    /// frame of the pinch off this baseline rather than the live offset,
+    /// because `onScrollGeometryChange` is async — by the time the next
+    /// pinch frame fires, the offset we just wrote hasn't been reported
+    /// back, and using the stale live value compounds an error per frame.
+    @State private var pinchStartScroll: CGPoint = .zero
+    /// Focal point of the pinch in image-natural coords, captured at
+    /// gesture start. Computed from `MagnifyGesture.startAnchor`, which
+    /// is the exact midpoint between the two fingers — more reliable than
+    /// relying on the last hover position because hover events stop firing
+    /// while the fingers are on the trackpad.
+    @State private var pinchStartFocal: CGPoint = .zero
+    /// True while a pinch gesture is in flight. Used to seed the three
+    /// snapshots above exactly once per gesture (on the first onChanged).
+    @State private var isPinching: Bool = false
+
     private let minZoom: CGFloat = 0.05
     private let maxZoom: CGFloat = 4.0
+    /// Padding around the image inside the scroll content. Needs to match
+    /// the `.padding(...)` modifier below for the zoom math to be correct.
+    private let imagePadding: CGFloat = 16
 
     init(url: URL, @ViewBuilder overlay: () -> Overlay) {
         self.url = url
@@ -55,7 +88,30 @@ struct ZoomableImageView<Overlay: View>: View {
                                 overlay
                             }
                         }
-                        .padding(16)
+                        // Track cursor in image-natural coords. `location`
+                        // here is in the image's local frame (already
+                        // dimensioned by `image.size * zoom`), so dividing
+                        // by zoom recovers the natural coords. This is what
+                        // we anchor zoom around so the bbox the user is
+                        // hovering stays under the cursor as zoom changes.
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let location):
+                                hoverInImage = CGPoint(
+                                    x: location.x / zoom,
+                                    y: location.y / zoom
+                                )
+                            case .ended:
+                                hoverInImage = nil
+                            }
+                        }
+                        // Trackpad two-finger pinch / spread → zoom around
+                        // the cursor. MagnifyGesture.Value.magnification is
+                        // the *cumulative* scale since the gesture started,
+                        // so we multiply against a snapshot of `zoom` taken
+                        // on the first onChanged of each gesture.
+                        .gesture(pinchGesture)
+                        .padding(imagePadding)
                         .frame(
                             minWidth: geo.size.width,
                             minHeight: geo.size.height,
@@ -70,6 +126,15 @@ struct ZoomableImageView<Overlay: View>: View {
                 }
             }
             .background(Color(nsColor: .controlBackgroundColor))
+            .scrollPosition($scrollPosition)
+            // Stash the current scroll offset on every change so we can
+            // compute "where the cursor lands in scroll content" without
+            // a second GeometryReader.
+            .onScrollGeometryChange(for: CGPoint.self) { geom in
+                geom.contentOffset
+            } action: { _, newOffset in
+                currentScrollOffset = newOffset
+            }
             // Keep containerSize in lock-step with the GeometryReader's
             // measurement. `initial: true` seeds it on first appearance.
             // applyFit() also re-snaps zoom while userZoomed is false, so
@@ -111,6 +176,9 @@ struct ZoomableImageView<Overlay: View>: View {
             .help("Zoom in (⌘+)")
             .keyboardShortcut("=", modifiers: [.command])
 
+            // Slider drives zoom directly. We can't pivot around the cursor
+            // here because the cursor is on the slider, not the image — so
+            // slider drags fall back to anchoring at the image center.
             Slider(value: $zoom, in: minZoom...maxZoom) { editing in
                 if !editing { userZoomed = true }
             }
@@ -124,8 +192,8 @@ struct ZoomableImageView<Overlay: View>: View {
             .keyboardShortcut("0", modifiers: [.command])
 
             Button("100%") {
+                setZoomAroundCursor(1.0)
                 userZoomed = true
-                zoom = 1.0
             }
             .help("Actual size (⌘1)")
             .keyboardShortcut("1", modifiers: [.command])
@@ -154,8 +222,86 @@ struct ZoomableImageView<Overlay: View>: View {
     // MARK: - Sizing
 
     private func adjustZoom(by factor: CGFloat) {
+        setZoomAroundCursor((zoom * factor).clamped(to: minZoom...maxZoom))
         userZoomed = true
-        zoom = (zoom * factor).clamped(to: minZoom...maxZoom)
+    }
+
+    /// Two-finger pinch on the trackpad. We snapshot zoom + scroll + focal
+    /// point once on the gesture's first frame, then on each subsequent
+    /// frame compute the new zoom and the new scroll offset *as absolute
+    /// values* from those snapshots. That avoids the drift that comes from
+    /// reading the live scroll offset every frame — `onScrollGeometryChange`
+    /// is async, so the live value lags one frame behind every scroll
+    /// write and the focal point would walk away from the cursor.
+    private var pinchGesture: some Gesture {
+        MagnifyGesture(minimumScaleDelta: 0.01)
+            .onChanged { value in
+                guard let img = image else { return }
+                if !isPinching {
+                    pinchStartZoom = zoom
+                    pinchStartScroll = currentScrollOffset
+                    // startAnchor is a UnitPoint (0..1) inside the gesture's
+                    // host view — the Image, sized `image.size * zoom`. So
+                    // `startAnchor * image.size` is the focal point in
+                    // *natural* image coords, independent of zoom.
+                    let anchor = value.startAnchor
+                    pinchStartFocal = CGPoint(
+                        x: anchor.x * img.size.width,
+                        y: anchor.y * img.size.height
+                    )
+                    isPinching = true
+                }
+
+                let newZoom = (pinchStartZoom * value.magnification)
+                    .clamped(to: minZoom...maxZoom)
+                zoom = newZoom
+                userZoomed = true
+
+                // Keep the focal point's screen position fixed across the
+                // whole gesture: new scroll = start scroll + focal * Δzoom.
+                let dx = pinchStartFocal.x * (newZoom - pinchStartZoom)
+                let dy = pinchStartFocal.y * (newZoom - pinchStartZoom)
+                scrollPosition.scrollTo(point: CGPoint(
+                    x: pinchStartScroll.x + dx,
+                    y: pinchStartScroll.y + dy
+                ))
+            }
+            .onEnded { _ in
+                isPinching = false
+            }
+    }
+
+    /// Change zoom while keeping the point currently under the mouse fixed
+    /// on screen — the same UX as Preview.app / Acorn / Photoshop. If the
+    /// mouse isn't over the image (e.g. we got here from a keyboard
+    /// shortcut while pointer is on the controlbar), zoom anchors at the
+    /// scroll viewport's center instead.
+    ///
+    /// Derivation: in scroll-content coordinates the cursor is at
+    /// `(currentScrollOffset + viewportCursor)`. The image's top-left
+    /// inside the scroll content is at `(imagePadding, imagePadding)`.
+    /// The point in image-natural coords under the cursor is
+    /// `hoverInImage = ((scrollOffset + viewportCursor) - imagePadding) / oldZoom`.
+    /// To keep that natural-image point fixed on screen after zooming to
+    /// `newZoom`, the new scrollOffset must be:
+    ///   newOffset = imagePadding + hoverInImage * newZoom - viewportCursor
+    /// Subtracting the old offset gives a delta of
+    ///   delta = hoverInImage * (newZoom − oldZoom)
+    /// which is what we apply.
+    private func setZoomAroundCursor(_ newZoom: CGFloat) {
+        let oldZoom = zoom
+        let clamped = newZoom.clamped(to: minZoom...maxZoom)
+        guard clamped != oldZoom else { return }
+        zoom = clamped
+
+        guard let hover = hoverInImage else { return }
+        let dx = hover.x * (clamped - oldZoom)
+        let dy = hover.y * (clamped - oldZoom)
+        let target = CGPoint(
+            x: currentScrollOffset.x + dx,
+            y: currentScrollOffset.y + dy
+        )
+        scrollPosition.scrollTo(point: target)
     }
 
     /// Recompute fit-to-window scale and apply it to `zoom` if the user

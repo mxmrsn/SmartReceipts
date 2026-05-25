@@ -76,10 +76,15 @@ final class LabelDraft {
 
         // Migrate any per-line-item bboxes off provenance and onto the
         // LineItemDraft itself, so deletes/reorders keep them in sync.
+        // Both keys are read: `lineItem.NNN` (description / whole row) and
+        // `lineItem.NNN.price` (price column).
         for (idx, item) in lineItems.enumerated() {
             let key = String(format: "lineItem.%03d", idx)
             if let box = r.provenance.bboxes[key] {
                 item.bbox = box
+            }
+            if let box = r.provenance.bboxes["\(key).price"] {
+                item.priceBBox = box
             }
         }
     }
@@ -123,6 +128,9 @@ final class LabelDraft {
             let key = String(format: "lineItem.%03d", idx)
             if let box = receipt.provenance.bboxes[key] {
                 item.bbox = box
+            }
+            if let box = receipt.provenance.bboxes["\(key).price"] {
+                item.priceBBox = box
             }
         }
     }
@@ -172,9 +180,10 @@ final class LabelDraft {
     /// reflects it.
     ///
     /// Line-item bboxes are NOT sourced from `basis.provenance.bboxes` —
-    /// they live on each `LineItemDraft`. We rebuild the `lineItem.NNN`
-    /// keys from the live array so that deleting an item removes its bbox
-    /// (and surviving items reindex to match their new positions).
+    /// they live on each `LineItemDraft`. We rebuild both the
+    /// `lineItem.NNN` (description) and `lineItem.NNN.price` (price column)
+    /// keys from the live array so that deleting an item removes both
+    /// bboxes (and surviving items reindex to match their new positions).
     var effectiveBBoxes: [String: OCRKit.Receipt.BBox] {
         var result: [String: OCRKit.Receipt.BBox] = [:]
         for (key, box) in basis.provenance.bboxes where !key.hasPrefix("lineItem.") {
@@ -184,19 +193,37 @@ final class LabelDraft {
             result[key] = box
         }
         for (idx, item) in lineItems.enumerated() {
+            let key = String(format: "lineItem.%03d", idx)
             if let box = item.bbox {
-                let key = String(format: "lineItem.%03d", idx)
                 result[key] = box
+            }
+            if let box = item.priceBBox {
+                result["\(key).price"] = box
             }
         }
         return result
     }
 
-    /// Parse `"lineItem.NNN"` → `NNN`. Returns nil for non-line-item keys.
-    private static func parseLineItemIndex(_ key: String) -> Int? {
+    /// Public helper: the bbox key the form should select when the user
+    /// taps a line item's description / price zone.
+    static func lineItemBBoxKey(index: Int, isPrice: Bool = false) -> String {
+        let base = String(format: "lineItem.%03d", index)
+        return isPrice ? "\(base).price" : base
+    }
+
+    /// Parse `"lineItem.NNN"` or `"lineItem.NNN.price"` → (index, isPrice).
+    /// Returns nil for non-line-item keys.
+    private static func parseLineItemKey(_ key: String) -> (index: Int, isPrice: Bool)? {
         let prefix = "lineItem."
         guard key.hasPrefix(prefix) else { return nil }
-        return Int(key.dropFirst(prefix.count))
+        let rest = String(key.dropFirst(prefix.count))
+        if rest.hasSuffix(".price") {
+            let idxPart = rest.dropLast(".price".count)
+            if let i = Int(idxPart) { return (i, true) }
+            return nil
+        }
+        if let i = Int(rest) { return (i, false) }
+        return nil
     }
 
     enum FieldTarget: String, Sendable, CaseIterable {
@@ -222,8 +249,29 @@ final class LabelDraft {
     /// EXIF metadata rather than the receipt text), create a small default
     /// box at the image center. The user can then drag/resize it into the
     /// right place using the overlay handles.
+    ///
+    /// For `lineItem.NNN` / `lineItem.NNN.price` we write to the
+    /// LineItemDraft itself so the box stays in sync with deletes/reorders.
+    /// Description and price get distinct default positions so they don't
+    /// overlap on creation (left-of-center for desc, right-of-center for $).
     func ensureBBox(for key: String) {
         guard effectiveBBoxes[key] == nil else { return }
+        if let parsed = LabelDraft.parseLineItemKey(key),
+           parsed.index >= 0, parsed.index < lineItems.count {
+            let item = lineItems[parsed.index]
+            if parsed.isPrice {
+                // Narrow box on the right side — price column.
+                item.priceBBox = OCRKit.Receipt.BBox(
+                    x: 0.70, y: 0.475, width: 0.20, height: 0.04
+                )
+            } else {
+                // Wider box on the left — description column.
+                item.bbox = OCRKit.Receipt.BBox(
+                    x: 0.10, y: 0.475, width: 0.55, height: 0.04
+                )
+            }
+            return
+        }
         // 30% wide × 5% tall, centered. Reasonable for a single text line.
         bboxOverrides[key] = OCRKit.Receipt.BBox(
             x: 0.35, y: 0.475, width: 0.30, height: 0.05
@@ -233,12 +281,17 @@ final class LabelDraft {
     /// Move a bbox by a normalized delta. Used by drag gestures on the
     /// selected bbox; clamps so the box stays inside [0,1].
     func translateBBox(key: String, by delta: CGSize) {
-        if let idx = LabelDraft.parseLineItemIndex(key),
-           idx >= 0, idx < lineItems.count,
-           var box = lineItems[idx].bbox {
+        if let parsed = LabelDraft.parseLineItemKey(key),
+           parsed.index >= 0, parsed.index < lineItems.count {
+            let item = lineItems[parsed.index]
+            guard var box = parsed.isPrice ? item.priceBBox : item.bbox else { return }
             box.x = max(0, min(1 - box.width, box.x + Double(delta.width)))
             box.y = max(0, min(1 - box.height, box.y + Double(delta.height)))
-            lineItems[idx].bbox = box
+            if parsed.isPrice {
+                item.priceBBox = box
+            } else {
+                item.bbox = box
+            }
             return
         }
         guard var box = effectiveBBoxes[key] else { return }
@@ -250,11 +303,18 @@ final class LabelDraft {
     /// Resize a bbox by dragging one of its corners. `corner` is 0=TL,
     /// 1=TR, 2=BL, 3=BR. Delta is in normalized image coordinates.
     func resizeBBox(key: String, corner: Int, by delta: CGSize) {
-        if let idx = LabelDraft.parseLineItemIndex(key),
-           idx >= 0, idx < lineItems.count,
-           let current = lineItems[idx].bbox,
-           let next = LabelDraft.applyCornerResize(box: current, corner: corner, delta: delta) {
-            lineItems[idx].bbox = next
+        if let parsed = LabelDraft.parseLineItemKey(key),
+           parsed.index >= 0, parsed.index < lineItems.count {
+            let item = lineItems[parsed.index]
+            guard let current = parsed.isPrice ? item.priceBBox : item.bbox,
+                  let next = LabelDraft.applyCornerResize(box: current, corner: corner, delta: delta) else {
+                return
+            }
+            if parsed.isPrice {
+                item.priceBBox = next
+            } else {
+                item.bbox = next
+            }
             return
         }
         guard let current = effectiveBBoxes[key],
@@ -303,6 +363,36 @@ final class LabelDraft {
         default: return nil
         }
         return box
+    }
+
+    /// Assign an OCR line to a specific line-item bbox slot identified by
+    /// its dotted key. Used when the user has selected a `lineItem.NNN`
+    /// (description) or `lineItem.NNN.price` slot and then clicks an OCR
+    /// line. We record the bbox AND, as a convenience, fill the matching
+    /// text/price field if it's currently empty.
+    func assignLine(_ line: OCRKit.OCRLine, toLineItemKey key: String) {
+        guard let parsed = LabelDraft.parseLineItemKey(key),
+              parsed.index >= 0, parsed.index < lineItems.count else { return }
+        let item = lineItems[parsed.index]
+        if parsed.isPrice {
+            item.priceBBox = line.box
+            // Convenience: parse a price from the line text. Only overwrite
+            // if the existing total is 0 — don't clobber user edits.
+            if let amount = LabelDraft.parseAmount(line.text), item.totalPrice == 0 {
+                item.totalPrice = amount
+            }
+        } else {
+            item.bbox = line.box
+            // Convenience: try splitting `desc … $price` and fill in both
+            // fields if the description is currently empty.
+            if item.itemDescription.trimmingCharacters(in: .whitespaces).isEmpty {
+                let (desc, price) = LabelDraft.splitDescriptionAndPrice(line.text)
+                item.itemDescription = desc
+                if let price, item.totalPrice == 0 {
+                    item.totalPrice = price
+                }
+            }
+        }
     }
 
     /// Assign an OCR line's text + bbox to a field. The form value updates
@@ -439,11 +529,15 @@ final class LineItemDraft: Identifiable {
     var unitPrice: Decimal?
     var totalPrice: Decimal
     var category: OCRKit.Receipt.Category?
-    /// Bbox attached to this specific line item. Lives with the LineItemDraft
-    /// (rather than in a separate `lineItem.NNN`-keyed dictionary) so that
-    /// deleting the item also drops its bbox, and reordering re-keys
-    /// automatically.
+    /// Description / whole-row bbox attached to this specific line item.
+    /// Lives with the LineItemDraft (rather than in a separate
+    /// `lineItem.NNN`-keyed dictionary) so that deleting the item also
+    /// drops its bbox, and reordering re-keys automatically.
     var bbox: OCRKit.Receipt.BBox?
+    /// Separate bbox for the price column. Optional and independent — a
+    /// line item can have a description bbox but no price bbox (or
+    /// vice-versa) until the user finishes annotating.
+    var priceBBox: OCRKit.Receipt.BBox?
 
     init(from item: OCRKit.Receipt.LineItem) {
         self.itemDescription = item.description
@@ -452,6 +546,7 @@ final class LineItemDraft: Identifiable {
         self.totalPrice = item.totalPrice
         self.category = item.category
         self.bbox = nil
+        self.priceBBox = nil
     }
 
     init(blank: ()) {
@@ -461,6 +556,7 @@ final class LineItemDraft: Identifiable {
         self.totalPrice = 0
         self.category = nil
         self.bbox = nil
+        self.priceBBox = nil
     }
 
     var asCanonical: OCRKit.Receipt.LineItem {

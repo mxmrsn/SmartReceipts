@@ -28,6 +28,20 @@ final class DatasetController {
     var pendingPreferredError: String?
     var isExtracting: Bool = false
 
+    /// Bumped every time `save(_:for:)` writes a label successfully. The
+    /// sidebar's EntryRow watches this and pulses a colored outline around
+    /// the row whose `imageID` matches — handy visual confirmation when
+    /// saving via ⌘S, since the action otherwise has no on-screen tell.
+    /// Includes `at: Date()` so back-to-back saves of the same row still
+    /// register as distinct events (Equatable on identity, not just id).
+    var lastSaveEvent: SaveEvent? = nil
+
+    struct SaveEvent: Equatable, Sendable {
+        let imageID: UUID
+        let status: LabelStatus
+        let at: Date
+    }
+
     /// Saved-vendor directory used by the LabelingView's quick-pick menu.
     let vendorStore = VendorStore()
 
@@ -177,6 +191,12 @@ final class DatasetController {
             statusMessage = "Saved \(doc.label.status.displayName) — \(entry.sourceFilename)"
             reload()
             select(entry.imageId)  // keep selection on the same entry
+            // Trigger the sidebar-row pulse for this entry.
+            lastSaveEvent = SaveEvent(
+                imageID: entry.imageId,
+                status: doc.label.status,
+                at: Date()
+            )
         } catch {
             statusMessage = "Save failed: \(error.localizedDescription)"
         }

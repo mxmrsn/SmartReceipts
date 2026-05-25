@@ -12,16 +12,27 @@ struct ReceiptFormSection: View {
 
     @Bindable var draft: LabelDraft
     let vendorStore: VendorStore
+    /// True if a label file currently exists on disk for this image. Drives
+    /// the wording / behaviour of the Discard button — discard reverts to
+    /// disk when there is a saved version, falls back to re-extract otherwise.
+    let hasSavedVersion: Bool
     let onSaveDraft: () -> Void
     let onVerify: () -> Void
     let onReject: () -> Void
+    /// Re-run the OCR pipeline on this image, replacing the live draft.
+    let onReExtract: () -> Void
+    /// Throw away unsaved edits and revert to the on-disk version.
+    let onDiscard: () -> Void
 
     @State private var showRawOCR: Bool = false
     @State private var newVendorAddedTick: Date = .distantPast
+    @State private var showReExtractConfirm: Bool = false
+    @State private var showDiscardConfirm: Bool = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
+                draftToolbar
                 // Tells the user which field is currently selected for
                 // drag-edit on the image. Doubles as the "drop target" hint
                 // when they click a faint OCR line — it'll be assigned here.
@@ -77,6 +88,77 @@ struct ReceiptFormSection: View {
             if let key = newKey {
                 draft.ensureBBox(for: key)
             }
+        }
+    }
+
+    // MARK: - Draft toolbar (Re-extract / Discard)
+
+    /// Compact action row that lives at the very top of the form. Two
+    /// destructive-ish operations on the current draft:
+    ///   - Re-extract: throws away the live draft and re-runs the OCR
+    ///     pipeline on the source image. Useful after improving a pipeline
+    ///     or when you want a fresh starting point.
+    ///   - Discard:    reverts to the on-disk version (if any), throwing
+    ///     away unsaved edits. Falls back to a re-extract when there's no
+    ///     saved version yet.
+    /// Both go through .confirmationDialog so an accidental click doesn't
+    /// destroy work in progress.
+    private var draftToolbar: some View {
+        HStack(spacing: 12) {
+            Button {
+                showReExtractConfirm = true
+            } label: {
+                Label("Re-extract", systemImage: "arrow.clockwise.circle")
+                    .font(.caption.weight(.medium))
+                    .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.borderless)
+            .help("Re-run the OCR pipeline on this image. Discards current edits.")
+
+            Button {
+                showDiscardConfirm = true
+            } label: {
+                Label(
+                    hasSavedVersion ? "Discard changes" : "Reset",
+                    systemImage: "arrow.uturn.backward.circle"
+                )
+                .font(.caption.weight(.medium))
+                .labelStyle(.titleAndIcon)
+            }
+            .buttonStyle(.borderless)
+            .help(
+                hasSavedVersion
+                    ? "Revert to the last version saved to disk."
+                    : "No saved version yet — re-runs the OCR pipeline."
+            )
+
+            Spacer()
+        }
+        .confirmationDialog(
+            "Re-extract this receipt?",
+            isPresented: $showReExtractConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Re-extract", role: .destructive) { onReExtract() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Re-runs the OCR pipeline against the image. Current edits and bounding-box adjustments will be lost.")
+        }
+        .confirmationDialog(
+            hasSavedVersion ? "Discard current changes?" : "Reset to a fresh extraction?",
+            isPresented: $showDiscardConfirm,
+            titleVisibility: .visible
+        ) {
+            Button(hasSavedVersion ? "Discard" : "Reset", role: .destructive) {
+                onDiscard()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                hasSavedVersion
+                    ? "Reverts to the version saved on disk. Unsaved edits will be lost."
+                    : "No saved version exists yet — this re-runs the OCR pipeline."
+            )
         }
     }
 
@@ -250,12 +332,17 @@ struct ReceiptFormSection: View {
                     .font(.caption)
             }
 
-            ForEach(draft.lineItems) { item in
-                LineItemRow(item: item, onRemove: {
-                    if let idx = draft.lineItems.firstIndex(where: { $0.id == item.id }) {
-                        draft.lineItems.remove(at: idx)
+            ForEach(Array(draft.lineItems.enumerated()), id: \.element.id) { idx, item in
+                LineItemRow(
+                    item: item,
+                    index: idx,
+                    selectedKey: $draft.selectedBBoxKey,
+                    onRemove: {
+                        if let i = draft.lineItems.firstIndex(where: { $0.id == item.id }) {
+                            draft.lineItems.remove(at: i)
+                        }
                     }
-                })
+                )
                 .padding(.vertical, 2)
             }
 
@@ -292,7 +379,7 @@ struct ReceiptFormSection: View {
             Button("Reject", role: .destructive) { onReject() }
             Spacer()
             Button("Save Draft") { onSaveDraft() }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .keyboardShortcut("s", modifiers: [.command])
             Button("Verify ✓") { onVerify() }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
@@ -318,7 +405,14 @@ struct ReceiptFormSection: View {
         case "date.value":        return "Date"
         case "totals.total":      return "Total"
         case "totals.subtotal":   return "Subtotal"
-        case let k where k.hasPrefix("lineItem."): return "Line item"
+        case let k where k.hasPrefix("lineItem."):
+            // lineItem.005 → "Line item #5"
+            // lineItem.005.price → "Line item #5 — price"
+            let rest = k.dropFirst("lineItem.".count)
+            let isPrice = rest.hasSuffix(".price")
+            let idxPart = isPrice ? rest.dropLast(".price".count) : Substring(rest)
+            let idxLabel = Int(idxPart).map { "#\($0 + 1)" } ?? ""
+            return isPrice ? "Line item \(idxLabel) — price" : "Line item \(idxLabel)"
         default: return bboxKey
         }
     }
@@ -479,22 +573,48 @@ private struct ConfidenceChip: View {
 }
 
 // MARK: - Line item row
+//
+// Two distinct click-zones so the user can target either bbox independently:
+//   - Description zone (left)  → key `lineItem.NNN`        (yellow box)
+//   - Price zone (right total) → key `lineItem.NNN.price`  (orange box)
+//
+// Each zone uses the same simultaneousGesture pattern as `LabeledFieldRow`
+// so taps still register when the user clicks directly on the TextField.
 
 private struct LineItemRow: View {
     @Bindable var item: LineItemDraft
+    let index: Int
+    @Binding var selectedKey: String?
     let onRemove: () -> Void
+
+    private var descKey: String { LabelDraft.lineItemBBoxKey(index: index, isPrice: false) }
+    private var priceKey: String { LabelDraft.lineItemBBoxKey(index: index, isPrice: true) }
+
+    private var descSelected: Bool { selectedKey == descKey }
+    private var priceSelected: Bool { selectedKey == priceKey }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Description zone — selects `lineItem.NNN` (description bbox).
             HStack(spacing: 8) {
-                TextField("Description", text: $item.itemDescription)
-                    .textFieldStyle(.roundedBorder)
+                LineItemZone(
+                    isSelected: descSelected,
+                    accent: .yellow,
+                    icon: "text.alignleft",
+                    selectionHint: "Item",
+                    onTap: { toggle(descKey) }
+                ) {
+                    TextField("Description", text: $item.itemDescription)
+                        .textFieldStyle(.roundedBorder)
+                }
                 Button(role: .destructive, action: onRemove) {
                     Image(systemName: "minus.circle.fill")
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.red.opacity(0.85))
             }
+            // Qty + price row. Only the price area is a click-zone — qty
+            // doesn't have its own bbox (yet).
             HStack(spacing: 8) {
                 TextField(
                     "Qty",
@@ -507,17 +627,78 @@ private struct LineItemRow: View {
                 .frame(maxWidth: 70)
                 .textFieldStyle(.roundedBorder)
                 Spacer()
-                Text("$")
-                    .foregroundStyle(.secondary)
-                TextField("Total", value: $item.totalPrice, format: .number.precision(.fractionLength(2)))
-                    .frame(maxWidth: 120)
-                    .textFieldStyle(.roundedBorder)
-                    .multilineTextAlignment(.trailing)
+                LineItemZone(
+                    isSelected: priceSelected,
+                    accent: .orange,
+                    icon: "dollarsign.circle",
+                    selectionHint: "Price",
+                    onTap: { toggle(priceKey) }
+                ) {
+                    HStack(spacing: 4) {
+                        Text("$").foregroundStyle(.secondary)
+                        TextField("Total", value: $item.totalPrice, format: .number.precision(.fractionLength(2)))
+                            .frame(maxWidth: 100)
+                            .textFieldStyle(.roundedBorder)
+                            .multilineTextAlignment(.trailing)
+                    }
+                }
             }
             .font(.callout)
         }
         .padding(8)
         .background(Color.gray.opacity(0.05))
         .cornerRadius(6)
+    }
+
+    private func toggle(_ key: String) {
+        selectedKey = (selectedKey == key) ? nil : key
+    }
+}
+
+/// One click-to-select sub-row inside a LineItemRow. Visually tracks the
+/// selection ring + an accent-colored chip showing which bbox it targets.
+private struct LineItemZone<Content: View>: View {
+    let isSelected: Bool
+    let accent: Color
+    let icon: String
+    let selectionHint: String
+    let onTap: () -> Void
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(isSelected ? Color.accentColor : accent)
+                .frame(width: 12)
+            content()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if isSelected {
+                Text(selectionHint)
+                    .font(.system(size: 9, weight: .semibold))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.accentColor.opacity(0.18))
+                    .foregroundStyle(Color.accentColor)
+                    .cornerRadius(3)
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(isSelected ? Color.accentColor.opacity(0.18) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1.5)
+        )
+        .contentShape(Rectangle())
+        // simultaneousGesture lets a tap on the inner TextField still
+        // bubble up to select the zone (otherwise the TextField swallows it).
+        .simultaneousGesture(
+            TapGesture()
+                .onEnded { _ in onTap() }
+        )
     }
 }

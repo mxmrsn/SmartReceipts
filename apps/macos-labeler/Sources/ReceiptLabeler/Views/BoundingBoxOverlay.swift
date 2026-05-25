@@ -27,10 +27,15 @@ struct BoundingBoxOverlay: View {
                             draft.selectedBBoxKey = field.bboxKey
                         },
                         onAssignToSelected: {
-                            guard let key = draft.selectedBBoxKey,
-                                  let field = LabelDraft.FieldTarget.allCases.first(where: { $0.bboxKey == key })
-                            else { return }
-                            draft.assign(line: line, to: field)
+                            guard let key = draft.selectedBBoxKey else { return }
+                            // Line-item keys are dynamic (lineItem.NNN[.price]),
+                            // so FieldTarget can't lookup them. Dispatch by
+                            // key prefix instead.
+                            if key.hasPrefix("lineItem.") {
+                                draft.assignLine(line, toLineItemKey: key)
+                            } else if let field = LabelDraft.FieldTarget.allCases.first(where: { $0.bboxKey == key }) {
+                                draft.assign(line: line, to: field)
+                            }
                         }
                     )
                 }
@@ -69,11 +74,21 @@ struct BoundingBoxOverlay: View {
         if let b = bboxes["totals.total"] {
             out.append(ClaimedItem(id: "total", bboxKey: "totals.total", label: "Total", color: .red, bbox: b))
         }
+        // Two streams of line-item bboxes: description rows (yellow) and
+        // price columns (orange). Distinct colors so a user scanning the
+        // overlay can tell at a glance which is which.
         let itemBoxes = bboxes
             .filter { $0.key.hasPrefix("lineItem.") }
             .sorted { $0.key < $1.key }
         for (idx, kv) in itemBoxes.enumerated() {
-            out.append(ClaimedItem(id: "li-\(idx)", bboxKey: kv.key, label: "Item", color: .yellow, bbox: kv.value))
+            let isPrice = kv.key.hasSuffix(".price")
+            out.append(ClaimedItem(
+                id: "li-\(idx)",
+                bboxKey: kv.key,
+                label: isPrice ? "$" : "Item",
+                color: isPrice ? .orange : .yellow,
+                bbox: kv.value
+            ))
         }
         return out
     }

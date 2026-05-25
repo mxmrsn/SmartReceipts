@@ -15,7 +15,7 @@ struct ImageGridView: View {
             Divider()
             List(selection: bindingSelection) {
                 ForEach(filtered) { entry in
-                    EntryRow(entry: entry)
+                    EntryRow(entry: entry, lastSaveEvent: controller.lastSaveEvent)
                         .tag(entry.imageId)
                 }
             }
@@ -92,6 +92,14 @@ struct ImageGridView: View {
 
 private struct EntryRow: View {
     let entry: DatasetEntry
+    let lastSaveEvent: DatasetController.SaveEvent?
+
+    /// Opacity of the pulse ring overlay. Set to 1 instantly on save, then
+    /// animated back to 0 over 700ms.
+    @State private var pulseOpacity: Double = 0
+    /// Tint of the pulse ring — green/red/blue depending on the save status
+    /// so the user can tell at a glance which action they just performed.
+    @State private var pulseColor: Color = .accentColor
 
     var body: some View {
         HStack(spacing: 8) {
@@ -110,6 +118,36 @@ private struct EntryRow: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 1)
+        .overlay {
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(pulseColor, lineWidth: 2.5)
+                .opacity(pulseOpacity)
+                .allowsHitTesting(false)
+        }
+        // When the controller bumps lastSaveEvent and it points at this
+        // row, snap the ring to fully visible, then fade it out. The
+        // double dispatch is intentional: it forces SwiftUI to render
+        // the opacity=1 state before starting the fade, so the animation
+        // doesn't get collapsed away in a single update cycle.
+        .onChange(of: lastSaveEvent) { _, new in
+            guard let new, new.imageID == entry.imageId else { return }
+            pulseColor = pulseTint(for: new.status)
+            pulseOpacity = 1.0
+            DispatchQueue.main.async {
+                withAnimation(.easeOut(duration: 0.7)) {
+                    pulseOpacity = 0.0
+                }
+            }
+        }
+    }
+
+    private func pulseTint(for status: LabelStatus) -> Color {
+        switch status {
+        case .draft:     .accentColor
+        case .verified:  .green
+        case .rejected:  .red
+        case .unlabeled: .gray
+        }
     }
 }
 
