@@ -75,7 +75,34 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // and its price on the same printed line arrive at the model as a
         // single row, separated by "  ". Massively reduces the
         // pair-across-lines errors we'd otherwise see.
-        let rows = Self.clusterByRow(lines)
+        //
+        // Filter out OCR observations that are receipt metadata, not item
+        // content. Safeway and similar chains print verbose annotations
+        // around every line item ("Regular Price", "Member Savings",
+        // "VOL+", "VOL-", "INFO", "WT") that interleave with the actual
+        // item rows after row clustering, confusing the LLM. Stripping
+        // them at the OCR level keeps the FM prompt focused on rows that
+        // carry a description + price.
+        let prunedLines = Self.dropMetadataObservations(lines)
+        // Strip trailing tax / SKU category markers from price-shaped
+        // segments so the LLM sees "8.49" instead of "8.49 S". Some chains
+        // (Safeway, Lucky, Albertsons) suffix every line price with a
+        // single uppercase letter indicating tax category, and FM
+        // otherwise refuses to recognize the rightmost segment as a price
+        // — it returned empty lineItems on the Safeway receipt until we
+        // sanded these off.
+        let cleanedLines = Self.stripTrailingTaxMarkers(prunedLines)
+        let rawRows = Self.clusterByRow(cleanedLines)
+        // After clustering, drop rows whose entire content is a money value
+        // or a single token of receipt metadata. These are the regular-price
+        // and savings-amount lines that the LLM otherwise misreads as new
+        // items because their "Regular Price" / "Member Savings" label
+        // sibling has already been pruned. Also strip trailing single-letter
+        // tax-category segments that survive clustering on their own bbox
+        // (Safeway prints "6.99  S" as two distinct observations).
+        let rows = rawRows
+            .filter { !Self.isOrphanedNumericRow($0) }
+            .map(Self.stripTrailingSingleLetterSegment)
         let spatialOCR = rows.enumerated().map { idx, row in
             let yPct = Int((row.meanY * 100).rounded())
             return String(format: "[R%02d y=%02d] %@", idx, yPct, row.joined)
@@ -84,13 +111,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let session = LanguageModelSession(instructions: Self.instructions)
         let prompt = "Receipt OCR, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and are listed left-to-right; on a line-item row the rightmost segment is almost always the price.\n\n\(spatialOCR)\n\nReturn ONLY the JSON object."
 
-        // Receipts with 20+ line items routinely overflowed the default budget
-        // and the model truncated mid-array, breaking JSON parsing. 4096 tokens
-        // comfortably fits a 40-item receipt as compact JSON.
+        // Apple's on-device FM has a fixed total context (input + output).
+        // Reserving too much for output starves the input — the long
+        // Safeway-style receipts then trigger "Exceeded model context
+        // window size" before generation even begins. The compact JSON
+        // schema we ask for fits a 25-item receipt in well under 1500
+        // tokens, so reserve that and leave plenty of room for the input
+        // OCR rows.
         let options = GenerationOptions(
             sampling: .greedy,
             temperature: 0.0,
-            maximumResponseTokens: 4096
+            maximumResponseTokens: 1500
         )
 
         let rawResponse: String
@@ -186,20 +217,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         - Use "" (empty string) for any field not visible. Do not guess merchant from filenames.
         - Do NOT wrap the JSON in markdown. Start your reply with { and end with }.
 
-        Example. Showing merchant normalization (TARGET COLMA → Target), date conversion, the total-vs-subtotal distinction, and the footer-row drop.
-
-        INPUT:
-        [R00 y=04] TARGET COLMA
-        [R01 y=08] 04/02/23
-        [R02 y=20] OREO COOKIE  3.99
-        [R03 y=24] 2 BANANAS  1.58
-        [R04 y=33] SUBTOTAL  5.57
-        [R05 y=35] TAX  0.32
-        [R06 y=38] TOTAL  5.89
-        [R07 y=42] VISA  5.89
-
-        OUTPUT:
-        {"merchantName":"Target","date":"2023-04-02","currency":"USD","total":"5.89","subtotal":"5.57","tax":"0.32","tip":"","discount":"","lineItems":[{"description":"OREO COOKIE","quantity":"","unitPrice":"","totalPrice":"3.99"},{"description":"BANANAS","quantity":"2","unitPrice":"","totalPrice":"1.58"}]}
+        Be aggressive about extracting items: every row that has a product-name-like segment AND a price-like number is a line item, even if it's mixed in among section headers ("GROCERY", "PRODUCE", "LIQUOR", etc.) or store-internal markers ("S", "T", "F"). When in doubt, INCLUDE the row — the postprocessor drops false positives. An empty lineItems array means the receipt has no purchased products, which is rare.
         """
 
     // MARK: - Mapping
@@ -305,6 +323,31 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 continue
             }
             deduped.append(c)
+        }
+
+        // Stage (e): break LLM repetition loops. Under low temperature the
+        // model occasionally cycles through the last few items it saw until
+        // the response budget is exhausted (we observed this on a Safeway
+        // receipt — same 4 items repeated 11 times). If any (desc, price)
+        // pair appears 3+ times, keep only the first occurrence and drop
+        // every later one. Legitimate "I bought the same thing twice"
+        // receipts almost always use a quantity stamp instead of repeating
+        // the row literally.
+        var occurrenceCount: [String: Int] = [:]
+        for c in deduped {
+            let key = "\(c.desc.lowercased())|\(c.price)"
+            occurrenceCount[key, default: 0] += 1
+        }
+        let loopingKeys = Set(occurrenceCount.compactMap { $0.value >= 3 ? $0.key : nil })
+        if !loopingKeys.isEmpty {
+            var seenLoopKey: Set<String> = []
+            deduped = deduped.filter { c in
+                let key = "\(c.desc.lowercased())|\(c.price)"
+                guard loopingKeys.contains(key) else { return true }
+                if seenLoopKey.contains(key) { return false }
+                seenLoopKey.insert(key)
+                return true
+            }
         }
 
         let items: [Receipt.LineItem] = deduped.map {
@@ -616,6 +659,126 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         return false
     }
 
+    // MARK: - OCR metadata pre-filter
+    //
+    // Drop OCR observations whose text is *only* receipt metadata — they
+    // surround real item rows on chain-grocery receipts ("Regular Price"
+    // and "Member Savings" beneath every Safeway item, etc.) and just
+    // confuse the LLM. We do this BEFORE row clustering so the surviving
+    // rows are clean description+price pairs. The full unfiltered line
+    // list still flows through `attachBBoxes` and into `ocrLines` for the
+    // labeler overlay, so dropped lines remain click-assignable.
+
+    /// Substring tests (lowercased) that mean "this line is metadata,
+    /// not a purchased item". An OCR observation matches if its text,
+    /// lowercased and trimmed, equals one of these or starts with one
+    /// followed by a space / colon / dash.
+    private static let metadataLinePatterns: [String] = [
+        "regular price",
+        "member savings",
+        "member price",
+        "you saved",
+        "you save",
+        "savings",
+        "discount",
+        "for personalized",
+        // Safeway prints "VOL+" / "VOL-" / "INFO" / "WT" markers in a
+        // far-left column that clusters with the price column.
+        "vol+", "vol-", "vol +", "vol -",
+        "info",
+        "wt",
+        // Loyalty / payment scaffolding that sometimes ends up clustered
+        // with a real row.
+        "rewards earned",
+        "points earned",
+    ]
+
+    /// Rewrite individual OCR segments that look like `"8.49 S"` or
+    /// `"3.50 T"` (price plus a single trailing tax/SKU letter) to drop
+    /// the letter. We only touch segments that match the strict
+    /// `decimal-then-letter` shape so legitimate item names like
+    /// `"COKE 12 OZ"` are untouched.
+    fileprivate static func stripTrailingTaxMarkers(
+        _ lines: [(text: String, box: Receipt.BBox)]
+    ) -> [(text: String, box: Receipt.BBox)] {
+        let pattern = #"^(-?\$?\d{1,5}(?:[.,]\d{1,2})?)(?:\s+([A-Z]))+\s*$"#
+        let regex = try? NSRegularExpression(pattern: pattern)
+        return lines.map { line in
+            guard let regex else { return line }
+            let trimmed = line.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            guard let match = regex.firstMatch(in: trimmed, options: [], range: range),
+                  let priceRange = Range(match.range(at: 1), in: trimmed)
+            else { return line }
+            return (text: String(trimmed[priceRange]), box: line.box)
+        }
+    }
+
+    fileprivate static func dropMetadataObservations(
+        _ lines: [(text: String, box: Receipt.BBox)]
+    ) -> [(text: String, box: Receipt.BBox)] {
+        lines.filter { line in
+            let lc = line.text
+                .lowercased()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !lc.isEmpty else { return false }
+            for pat in metadataLinePatterns {
+                if lc == pat { return false }
+                if lc.hasPrefix(pat + " ") { return false }
+                if lc.hasPrefix(pat + ":") { return false }
+                if lc.hasPrefix(pat + "-") { return false }
+            }
+            return true
+        }
+    }
+
+    /// Drop the rightmost segment from a row when it's a single uppercase
+    /// letter (tax category) sitting next to a price-shaped segment. After
+    /// clustering, `6.99  S` is two segments; we want the row to look like
+    /// `CHOBANI YGRT VAN G  6.99` so the LLM treats the number as the
+    /// price. If the rightmost two segments don't look like
+    /// `<price> <single-letter>`, leave the row alone.
+    fileprivate static func stripTrailingSingleLetterSegment(_ row: OCRRow) -> OCRRow {
+        // Segments aren't sorted in `row.segments`; the `joined` accessor
+        // sorts by x for display. We need the rightmost (highest x) here.
+        let sortedByX = row.segments.sorted { $0.x < $1.x }
+        guard sortedByX.count >= 2 else { return row }
+        let last = sortedByX[sortedByX.count - 1].text.trimmingCharacters(in: .whitespaces)
+        let prev = sortedByX[sortedByX.count - 2].text.trimmingCharacters(in: .whitespaces)
+        let isSingleUpper = last.count == 1 && last.range(of: "^[A-Z]$", options: .regularExpression) != nil
+        let isPrice = prev.range(of: #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?$"#, options: .regularExpression) != nil
+        guard isSingleUpper, isPrice else { return row }
+        var row = row
+        // Find and remove the last-x segment from the original (unsorted)
+        // segments array.
+        if let dropIdx = row.segments.indices.max(by: { row.segments[$0].x < row.segments[$1].x }) {
+            row.segments.remove(at: dropIdx)
+        }
+        return row
+    }
+
+    /// True if a clustered row has no description, only money values /
+    /// trailing dashes. These are the orphaned "regular price" and
+    /// "savings amount" rows left behind when their label sibling was
+    /// pruned by `dropMetadataObservations` — including them would tempt
+    /// the LLM to invent extra line items.
+    fileprivate static func isOrphanedNumericRow(_ row: OCRRow) -> Bool {
+        let segments = row.segments
+        guard !segments.isEmpty else { return true }
+        // Every segment must look like a price (or be a single-letter
+        // store-code marker like "S" / "T" / "C1]") for the row to count
+        // as orphaned.
+        let priceish = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?-?$"#
+        let trailMarker = #"^[A-Z]?\d?[A-Z]?-?$"#
+        for seg in segments {
+            let t = seg.text.trimmingCharacters(in: .whitespaces)
+            if t.range(of: priceish, options: .regularExpression) != nil { continue }
+            if t.range(of: trailMarker, options: .regularExpression) != nil { continue }
+            return false
+        }
+        return true
+    }
+
     // MARK: - OCR row clustering
 
     /// One visual row of the receipt, made up of one or more OCR
@@ -623,6 +786,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// left-to-right by X so prompt rows mirror printed receipt rows.
     fileprivate struct OCRRow {
         var segments: [(text: String, x: Double)]
+        /// yMin/yMax track the *seed* line's bounds and don't grow as more
+        /// segments are absorbed. Snowballing the range across joiners is
+        /// what produced the original failure on dense Safeway receipts:
+        /// each absorption widens the gate just enough to admit the next
+        /// row, and a whole vertical band collapses into one [R##].
         var yMin: Double
         var yMax: Double
 
@@ -636,12 +804,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
     }
 
-    /// Group OCR observations into visual rows. Two observations belong to
-    /// the same row when they vertically overlap by at least ~40% of the
-    /// shorter one's height. This collapses the very common case where the
-    /// description and the price land on the same printed line but Vision
-    /// returns them as two separate observations — the exact case FM was
-    /// struggling to pair up using Y-percentage hints alone.
+    /// Group OCR observations into visual rows. A new line joins the
+    /// current row only when its vertical center lies within ~50% of
+    /// the seed line's height of the seed's center. Using the seed
+    /// (not a cumulative range) prevents the snowballing failure on
+    /// dense receipts.
     fileprivate static func clusterByRow(
         _ lines: [(text: String, box: Receipt.BBox)]
     ) -> [OCRRow] {
@@ -652,14 +819,16 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         for line in sorted {
             let yTop = line.box.y
             let yBot = line.box.y + line.box.height
-            let height = line.box.height
+            let centerY = (yTop + yBot) / 2
             if var current = rows.last {
-                let overlap = min(yBot, current.yMax) - max(yTop, current.yMin)
-                let minH = min(height, current.yMax - current.yMin)
-                if minH > 0, overlap >= minH * 0.4 {
+                let seedCenter = (current.yMin + current.yMax) / 2
+                let seedHeight = current.yMax - current.yMin
+                // Tolerance scales with the seed line's height so it adapts
+                // to dense small-text receipts and big-font ones alike.
+                let tolerance = max(0.005, seedHeight * 0.5)
+                if abs(centerY - seedCenter) <= tolerance {
                     current.segments.append((text: line.text, x: line.box.x))
-                    current.yMin = min(current.yMin, yTop)
-                    current.yMax = max(current.yMax, yBot)
+                    // Intentionally do NOT widen current.yMin / yMax here.
                     rows[rows.count - 1] = current
                     continue
                 }
