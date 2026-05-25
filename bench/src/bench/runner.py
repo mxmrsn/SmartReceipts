@@ -35,6 +35,7 @@ from bench.report import (
     write_html_diffs,
 )
 from bench.lint import lint_all, summarize
+from bench.prelabel import run_prelabel
 
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -91,6 +92,75 @@ def verify_label(image_id: str) -> None:
     """Verify a single label file parses against the canonical schema."""
     sample = load_label(image_id)
     console.print(f"[green]ok[/green] {image_id} status={sample.label_status} total={sample.label.totals.total}")
+
+
+@app.command()
+def prelabel(
+    pipeline: str = typer.Option(
+        "vision-fm",
+        help="Swift pipeline id to use as the pre-label annotator.",
+    ),
+    overwrite_drafts: bool = typer.Option(
+        False, "--overwrite-drafts",
+        help="Replace existing draft labels too. Verified labels are still safe."
+    ),
+    overwrite_all: bool = typer.Option(
+        False, "--overwrite-all",
+        help="DANGER: also replace verified labels. Almost never what you want."
+    ),
+    limit: Optional[int] = typer.Option(
+        None, help="Stop after this many images (handy for smoke tests)."
+    ),
+) -> None:
+    """Batch pre-label dataset/images/ with the chosen pipeline. Writes one
+    draft label per image into dataset/labels/{imageId}.json — the labeler
+    will pick them up under the same deterministic id.
+
+    Defaults are conservative: never touches verified labels, never replaces
+    existing drafts. Use --overwrite-drafts to re-run with a newer pipeline.
+    """
+    if overwrite_all and not overwrite_drafts:
+        # --overwrite-all implies --overwrite-drafts.
+        overwrite_drafts = True
+
+    counts = {"wrote": 0, "skipped-existing": 0, "failed": 0}
+    failures: list[tuple[str, str]] = []  # (image_name, reason)
+
+    def progress(i: int, total: int, outcome) -> None:
+        counts[outcome.status] = counts.get(outcome.status, 0) + 1
+        if outcome.status == "wrote":
+            console.print(
+                f"[green]✓[/green] [{i}/{total}] {outcome.image_path.name} "
+                f"→ {outcome.image_id[:8]} ({outcome.latency_ms} ms)"
+            )
+        elif outcome.status == "skipped-existing":
+            # Skips are quiet — too noisy on incremental runs.
+            pass
+        else:
+            failures.append((outcome.image_path.name, outcome.reason))
+            console.print(
+                f"[red]✗[/red] [{i}/{total}] {outcome.image_path.name}: {outcome.reason}"
+            )
+
+    console.print(f"Pre-labeling with [bold]{pipeline}[/bold]…")
+    run_prelabel(
+        pipeline_id=pipeline,
+        overwrite_drafts=overwrite_drafts,
+        overwrite_all=overwrite_all,
+        limit=limit,
+        on_progress=progress,
+    )
+
+    console.print("")
+    console.print(
+        f"[bold]Done[/bold] · wrote {counts['wrote']} · "
+        f"skipped {counts['skipped-existing']} · "
+        f"failed {counts['failed']}"
+    )
+    if failures and len(failures) <= 20:
+        console.print("\n[bold]Failures:[/bold]")
+        for name, reason in failures:
+            console.print(f"  • {name}: {reason}")
 
 
 @app.command()
