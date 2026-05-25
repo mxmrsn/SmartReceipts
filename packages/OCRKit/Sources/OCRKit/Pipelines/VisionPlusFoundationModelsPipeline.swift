@@ -116,6 +116,29 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         // ---- 3) Build canonical Receipt ----
         var receipt = Self.buildReceipt(from: extracted)
+        // Snap merchant to a canonical brand name when we can identify one
+        // in the OCR header. Catches FM picking a city ("Colma" for
+        // "Target Colma"), an OCR misread ("how doers" for "Home Depot"),
+        // or an inconsistent specificity ("sprouts" vs full chain name).
+        // The OCR lines are already sorted top-to-bottom by Y, so passing
+        // them as-is gives the header band the right priority.
+        let orderedLineTexts = lines.map(\.text)
+        if let brand = MerchantBrands.canonicalBrand(inTopOf: orderedLineTexts) {
+            // Override when FM either (a) returned a city / department /
+            // store-number-style string, or (b) returned a known city
+            // outright, or (c) returned a clearly looser variant. Otherwise
+            // keep FM's pick (handles legit non-chain restaurants).
+            let fmName = receipt.header.merchant.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let shouldOverride =
+                fmName.isEmpty
+                || fmName.lowercased() == "unknown"
+                || MerchantBrands.looksLikeCity(fmName)
+                || !fmName.lowercased().contains(brand.lowercased().prefix(4))
+            if shouldOverride {
+                receipt.header.merchant.name = brand
+                receipt.provenance.fieldConfidence["merchant.name"] = 0.95
+            }
+        }
         // Backfill bboxes by matching extracted field values back to OCR lines.
         // The bbox overlay in the labeler uses these to highlight detections.
         receipt = Self.attachBBoxes(receipt: receipt, lines: lines)
@@ -153,23 +176,52 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         Rules:
         - All money fields are plain decimal strings like "12.34". No currency symbols, no thousands separators.
         - Currency is a 3-letter ISO 4217 code. Default to "USD" if unclear.
-        - Date is strictly YYYY-MM-DD. If the receipt only shows a 2-digit year, assume 20YY.
+        - Date is strictly YYYY-MM-DD. If the receipt only shows a 2-digit year, assume 20YY. NEVER invent a date — if no date is visible, return "".
+        - merchantName must be the STORE / CHAIN name (e.g. "Target", "Costco", "Philz Coffee"). It is almost always the largest text near the top. Do NOT use the city, the address line, the cashier name, the department, or a store number. "TARGET T-1234 COLMA" → "Target", not "Colma".
+        - total is the GRAND TOTAL (the amount actually charged). It is usually labelled "TOTAL", "AMOUNT DUE", or "BALANCE DUE", appears near the bottom, and is ≥ subtotal. NEVER return subtotal in the total field — if you only see a subtotal, leave total "".
         - lineItems contains only purchased products in receipt order. Do NOT include subtotal / tax / total / tip / discount / payment / change / balance due / card / credit / debit / cashback / loyalty / rewards / auth rows — those go in their dedicated fields above (or are dropped entirely).
         - One row = at most one line item. On a line-item row, the rightmost segment is the price; segments before it form the description (and quantity if present).
         - When a quantity prefix appears ("2 ITEM", "2x ITEM", "QTY 2  ITEM"), set the quantity field separately and put just the item name in description.
         - If a description-only row has no price and the row immediately below it is price-only at a nearby Y, treat that pair as ONE line item — but this should be rare after row grouping.
         - Use "" (empty string) for any field not visible. Do not guess merchant from filenames.
         - Do NOT wrap the JSON in markdown. Start your reply with { and end with }.
+
+        Example. Showing merchant normalization (TARGET COLMA → Target), date conversion, the total-vs-subtotal distinction, and the footer-row drop.
+
+        INPUT:
+        [R00 y=04] TARGET COLMA
+        [R01 y=08] 04/02/23
+        [R02 y=20] OREO COOKIE  3.99
+        [R03 y=24] 2 BANANAS  1.58
+        [R04 y=33] SUBTOTAL  5.57
+        [R05 y=35] TAX  0.32
+        [R06 y=38] TOTAL  5.89
+        [R07 y=42] VISA  5.89
+
+        OUTPUT:
+        {"merchantName":"Target","date":"2023-04-02","currency":"USD","total":"5.89","subtotal":"5.57","tax":"0.32","tip":"","discount":"","lineItems":[{"description":"OREO COOKIE","quantity":"","unitPrice":"","totalPrice":"3.99"},{"description":"BANANAS","quantity":"2","unitPrice":"","totalPrice":"1.58"}]}
         """
 
     // MARK: - Mapping
 
     private static func buildReceipt(from x: ReceiptExtraction) -> Receipt {
-        let total: Decimal = parseDecimal(x.total) ?? 0
-        let subtotal: Decimal? = parseDecimal(x.subtotal)
+        var total: Decimal = parseDecimal(x.total) ?? 0
+        var subtotal: Decimal? = parseDecimal(x.subtotal)
         let taxAmount: Decimal? = parseDecimal(x.tax)
         let tip: Decimal? = parseDecimal(x.tip)
         let discount: Decimal? = parseDecimal(x.discount)
+
+        // Sanity: the grand total can never be less than the subtotal.
+        // FM occasionally flips them (we've seen `total = $28.79`,
+        // `subtotal = $28.79`, but the actual total on the receipt was
+        // $31.49 — FM grabbed the subtotal row twice). When they're
+        // inverted, swap — the larger value is almost always the actual
+        // grand total.
+        if let sub = subtotal, total > 0, total < sub {
+            let oldTotal = total
+            total = sub
+            subtotal = oldTotal
+        }
 
         let currencyCode: String = {
             let c = x.currency.trimmingCharacters(in: .whitespaces).uppercased()
@@ -180,9 +232,20 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             let d = x.date.trimmingCharacters(in: .whitespaces)
             // Year locked to 19xx/20xx so a 2-digit-year misread like
             // "0024" → "0024-02-04" doesn't sneak past the canonical schema.
-            return d.range(of: #"^(19|20)\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil
-                ? d
-                : "1970-01-01"
+            guard d.range(of: #"^(19|20)\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else {
+                return "1970-01-01"
+            }
+            // Plausibility: receipts are never from the future and almost
+            // never more than ~10 years old in a labeling workflow. We've
+            // seen FM hallucinate "2024-09-19" for a clearly-2023 receipt.
+            // Returning the sentinel triggers the labeler's EXIF-date
+            // fallback path, which is much more reliable than guessing.
+            let year = Int(d.prefix(4)) ?? 0
+            let currentYear = Calendar.current.component(.year, from: Date())
+            if year < currentYear - 10 || year > currentYear + 1 {
+                return "1970-01-01"
+            }
+            return d
         }()
 
         var fieldConf: [String: Double] = [:]
@@ -192,18 +255,64 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         if total > 0                    { fieldConf["totals.total"]  = 0.90 }
         if subtotal != nil              { fieldConf["totals.subtotal"] = 0.85 }
 
-        let items: [Receipt.LineItem] = x.lineItems.compactMap { row in
+        // Three-stage line-item cleanup. FM is told to skip footer rows but
+        // regresses often enough that we treat the LLM output as candidate
+        // and re-filter here. Each stage drops a specific failure mode we
+        // see repeatedly:
+        //   (a) empty/footer rows
+        //   (b) zero-price rows ("FREE GIFT" promos, etc. — the schema
+        //       requires nonzero, and 0 makes line-item-sum metrics noisy)
+        //   (c) prices ≥ grand-total (almost certainly the total line
+        //       leaking through, since no single item on a multi-item
+        //       receipt exceeds the receipt's own total)
+        //   (d) adjacent duplicates (FM sometimes restates the same row)
+        struct Candidate {
+            let desc: String
+            let qty: Decimal?
+            let unit: Decimal?
+            let price: Decimal
+        }
+        var candidates: [Candidate] = x.lineItems.compactMap { row in
             let desc = row.description.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !desc.isEmpty else { return nil }
-            // Defensive net: FM occasionally copies footer rows (CHANGE, CREDIT,
-            // BALANCE DUE, etc.) into lineItems despite the instructions.
             guard !isFooterRow(desc) else { return nil }
-            guard let price = parseDecimal(row.totalPrice) else { return nil }
-            return Receipt.LineItem(
-                description: desc,
-                quantity: parseDecimal(row.quantity),
-                unitPrice: parseDecimal(row.unitPrice),
-                totalPrice: price,
+            // FM sometimes emits `unitPrice` but omits `totalPrice` even
+            // when the receipt only prints one number per line. Treat
+            // unitPrice as a fallback so we don't drop legit items just
+            // because the model picked the "wrong" field name.
+            let totalPriceDec = parseDecimal(row.totalPrice)
+            let unitPriceDec = parseDecimal(row.unitPrice)
+            guard let price = totalPriceDec ?? unitPriceDec, price > 0 else { return nil }
+            return Candidate(
+                desc: desc,
+                qty: parseDecimal(row.quantity),
+                unit: totalPriceDec != nil ? unitPriceDec : nil,
+                price: price
+            )
+        }
+
+        // Stage (c): drop items whose price meets or exceeds the receipt
+        // total. Only safe when total is known and there are at least two
+        // items — a single-item receipt legitimately has price == total.
+        if total > 0, candidates.count > 1 {
+            candidates.removeAll { $0.price >= total }
+        }
+
+        // Stage (d): collapse adjacent duplicates with the same desc + price.
+        var deduped: [Candidate] = []
+        for c in candidates {
+            if let last = deduped.last, last.desc == c.desc, last.price == c.price {
+                continue
+            }
+            deduped.append(c)
+        }
+
+        let items: [Receipt.LineItem] = deduped.map {
+            Receipt.LineItem(
+                description: $0.desc,
+                quantity: $0.qty,
+                unitPrice: $0.unit,
+                totalPrice: $0.price,
                 category: nil
             )
         }
@@ -246,12 +355,64 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
     private static func parseJSON(_ output: String) throws -> ReceiptExtraction {
         let cleaned = cleanJSONFence(output)
-        guard let data = cleaned.data(using: .utf8) else {
+        guard let data = (coerceNumericStrings(cleaned)).data(using: .utf8) else {
             throw NSError(domain: "FMPipeline", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "Empty model output"
             ])
         }
-        return try JSONDecoder().decode(ReceiptExtraction.self, from: data)
+        do {
+            return try JSONDecoder().decode(ReceiptExtraction.self, from: data)
+        } catch {
+            // Best-effort salvage: when FM exceeds its response budget the
+            // JSON is truncated mid-string, so the decoder fails. Drop the
+            // trailing partial line item, close the array + object, and
+            // try once more — better to keep 7 valid items than to drop
+            // the whole receipt.
+            if let salvaged = salvageTruncatedJSON(cleaned),
+               let salvagedData = coerceNumericStrings(salvaged).data(using: .utf8),
+               let receipt = try? JSONDecoder().decode(ReceiptExtraction.self, from: salvagedData) {
+                return receipt
+            }
+            throw error
+        }
+    }
+
+    /// FM occasionally emits `"quantity": 2` (numeric) when the schema
+    /// asked for `"quantity": "2"` (string). Convert unquoted numbers to
+    /// quoted strings for the four numeric-string fields so the Codable
+    /// struct decodes either form. Other JSON shape stays intact.
+    private static func coerceNumericStrings(_ json: String) -> String {
+        let pattern = #""(quantity|unitPrice|totalPrice|total|subtotal|tax|tip|discount)"\s*:\s*(-?\d+(?:\.\d+)?)"#
+        return json.replacingOccurrences(
+            of: pattern,
+            with: "\"$1\":\"$2\"",
+            options: .regularExpression
+        )
+    }
+
+    /// Attempt to repair JSON that was cut off mid-output (FM hit its
+    /// response token budget or the model's context window). Strategy:
+    ///   1. Find the last complete `},` inside the `lineItems` array.
+    ///   2. Truncate everything after it.
+    ///   3. Close the array with `]` and the outer object with `}`.
+    /// Returns nil if the input doesn't look like our schema at all
+    /// (e.g. no `"lineItems"` key), so the caller can re-raise the
+    /// original parse error rather than papering over it.
+    private static func salvageTruncatedJSON(_ json: String) -> String? {
+        guard let itemsStart = json.range(of: "\"lineItems\"")?.upperBound else { return nil }
+        // Find the last "}," in the lineItems region. That's the boundary
+        // after the last complete line-item object.
+        let afterItems = json[itemsStart...]
+        guard let lastBoundary = afterItems.range(of: "},", options: .backwards) else {
+            // No complete items in the array yet — close it empty.
+            // First make sure the prefix up to the array opening is sane.
+            guard let arrayOpen = afterItems.range(of: "[") else { return nil }
+            let head = String(json[..<arrayOpen.upperBound])
+            return head + "]}"
+        }
+        // Keep through the closing `}` of the last item (drop the trailing `,`)
+        let kept = json[..<lastBoundary.lowerBound] + "}"
+        return String(kept) + "]}"
     }
 
     /// Strip Markdown code fences and stray prose around the JSON object.
@@ -535,6 +696,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
 // MARK: - Plain Codable shape (no macros)
 
+// Every field is decoded via `decodeIfPresent` so FM omitting one (a real
+// failure mode we see when the response is truncated or the model swaps
+// `unitPrice`/`totalPrice`) doesn't blow up the whole parse — we'd rather
+// get a partial Receipt than nothing at all. Default-value-on-property
+// alone does NOT help with the synthesized Codable; it still requires
+// every key. Hence the manual init.
 private struct ReceiptExtraction: Codable {
     var merchantName: String
     var date: String
@@ -545,6 +712,19 @@ private struct ReceiptExtraction: Codable {
     var tip: String
     var discount: String
     var lineItems: [ReceiptLineItemExtraction]
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        merchantName = try c.decodeIfPresent(String.self, forKey: .merchantName) ?? ""
+        date         = try c.decodeIfPresent(String.self, forKey: .date)         ?? ""
+        currency     = try c.decodeIfPresent(String.self, forKey: .currency)     ?? ""
+        total        = try c.decodeIfPresent(String.self, forKey: .total)        ?? ""
+        subtotal     = try c.decodeIfPresent(String.self, forKey: .subtotal)     ?? ""
+        tax          = try c.decodeIfPresent(String.self, forKey: .tax)          ?? ""
+        tip          = try c.decodeIfPresent(String.self, forKey: .tip)          ?? ""
+        discount     = try c.decodeIfPresent(String.self, forKey: .discount)     ?? ""
+        lineItems    = try c.decodeIfPresent([ReceiptLineItemExtraction].self, forKey: .lineItems) ?? []
+    }
 }
 
 private struct ReceiptLineItemExtraction: Codable {
@@ -552,6 +732,14 @@ private struct ReceiptLineItemExtraction: Codable {
     var quantity: String
     var unitPrice: String
     var totalPrice: String
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        quantity    = try c.decodeIfPresent(String.self, forKey: .quantity)    ?? ""
+        unitPrice   = try c.decodeIfPresent(String.self, forKey: .unitPrice)   ?? ""
+        totalPrice  = try c.decodeIfPresent(String.self, forKey: .totalPrice)  ?? ""
+    }
 }
 
 #endif
