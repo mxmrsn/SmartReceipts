@@ -201,6 +201,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             receipt = Self.correctRegularPriceMistakes(receipt: receipt, lines: postLines)
             receipt = Self.recoverMissedLineItems(receipt: receipt, lines: postLines)
         }
+        // Guardrail: FM sometimes picks a totally wrong value for the
+        // grand total — a "Total Savings Value" from the SAVINGS block
+        // (IMG_2942: $5.53 instead of $56.75) or a straight-up
+        // hallucination not present in the OCR at all (IMG_7951:
+        // $161.99 when the receipt prints $93.16). Cross-check against
+        // (a) the value actually appearing in OCR near a totals label
+        // and (b) the arithmetic sum of line items plus tax.
+        receipt = Self.sanityCheckTotal(receipt: receipt, lines: postLines)
         // Snap merchant to a canonical brand name when we can identify one
         // in the OCR header. Catches FM picking a city ("Colma" for
         // "Target Colma"), an OCR misread ("how doers" for "Home Depot"),
@@ -1552,6 +1560,197 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ///
     /// Conservative — only swaps when all three conditions are met, so
     /// receipts that print only one price per item are untouched.
+    /// Verify the extracted grand total against what's actually printed
+    /// on the receipt. FM has two failure modes we've observed:
+    ///
+    /// * **Wrong source row** — FM picks "Total" from a "YOUR SAVINGS"
+    ///   summary block instead of the "**** BALANCE" grand total.
+    ///   IMG_2942 landed on $5.53 (savings total) when the real balance
+    ///   was $56.75.
+    ///
+    /// * **Hallucination** — FM emits a value not present anywhere in
+    ///   the OCR. IMG_7951's $161.99 doesn't appear in any observation;
+    ///   the actual total prints as $93.16 three times.
+    ///
+    /// The correction:
+    ///   1. Compute an expected total from arithmetic:
+    ///      `expected = items_sum + tax + tip - discount`.
+    ///   2. Scan the OCR for every value on a row whose text starts with
+    ///      a totals-block keyword ("BALANCE", "PAYMENT AMOUNT",
+    ///      "AMOUNT DUE", "TOTAL", "GRAND TOTAL"). These are the true
+    ///      candidates for the grand total.
+    ///   3. Only override when FM's total is BOTH:
+    ///      (a) suspicious — either not present in ANY OCR observation
+    ///          (hallucination), OR less than half the arithmetic
+    ///          expectation (savings-block confusion),
+    ///      AND
+    ///      (b) we have at least one OCR-anchored candidate that fits
+    ///          the arithmetic within 5% tolerance.
+    ///
+    /// The conservative gate on (a) prevents the guardrail from
+    /// second-guessing FM on ordinary receipts where its total is fine.
+    private static func sanityCheckTotal(
+        receipt input: Receipt,
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt {
+        var receipt = input
+        let fmTotal = receipt.totals.total
+        guard fmTotal > 0 else { return receipt }
+
+        // Compute the arithmetic-expected total from line items + tax
+        // - discount + tip. Items are the strongest signal we have when
+        // there are enough of them.
+        let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
+        let taxSum: Decimal = receipt.totals.tax.reduce(0) { $0 + $1.amount }
+        let tip: Decimal = receipt.totals.tip ?? 0
+        let discount: Decimal = receipt.totals.discount ?? 0
+        let expected: Decimal = itemsSum + taxSum + tip - discount
+
+        // Does FM's total actually appear anywhere in the OCR?
+        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        func priceValue(_ text: String) -> Decimal? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
+            let normalized = trimmed
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: ",", with: ".")
+                .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
+            return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
+        }
+        let fmTotalPresent = lines.contains { line in
+            priceValue(line.text) == fmTotal
+        }
+
+        // Flag 1: FM's total is hallucinated (not in OCR at all).
+        let hallucinated = !fmTotalPresent
+
+        // Flag 2: items_sum >> total × 2 suggests FM picked a small
+        // savings/discount value instead of the real total. Only fires
+        // when we have enough items to trust items_sum.
+        let savingsBlockConfusion =
+            receipt.lineItems.count >= 3
+            && itemsSum > fmTotal * Decimal(2)
+
+        guard hallucinated || savingsBlockConfusion else { return receipt }
+
+        // Gather grand-total candidates: any price observation on a row
+        // whose text starts with a "grand-total" keyword. We accept
+        // multi-word keywords too ("PAYMENT AMOUNT", "AMOUNT DUE",
+        // "GRAND TOTAL") — the naive first-token check misses those.
+        // For split observations ("**** BALANCE" and "56.75" as two
+        // separate obs at the same Y), we scan same-Y neighbors of
+        // each label.
+        let grandTotalKeywords: [String] = [
+            "grand total", "balance due", "total due",
+            "amount due", "amount paid", "amount payable",
+            "payment amount",
+            "balance", "total",
+        ]
+
+        func normalizeForKeyword(_ text: String) -> String {
+            text.lowercased()
+                .replacingOccurrences(of: #"[^a-z0-9 ]"#, with: " ", options: .regularExpression)
+                .replacingOccurrences(of: #" +"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        func isTotalsLabel(_ text: String) -> Bool {
+            let stripped = normalizeForKeyword(text)
+            for kw in grandTotalKeywords {
+                if stripped == kw { return true }
+                if stripped.hasPrefix(kw + " ") { return true }
+                // Also allow "AMOUNT PAID 56.75" style where the price
+                // is a trailing token — the prefix check already covers
+                // this. And "56.75 BALANCE" (rare) where value is first
+                // and label is second.
+                if stripped.hasSuffix(" " + kw) { return true }
+            }
+            return false
+        }
+
+        struct Candidate { let value: Decimal; let y: Double }
+        var candidates: [Candidate] = []
+        for (idx, line) in lines.enumerated() {
+            guard isTotalsLabel(line.text) else { continue }
+            // Inline: any price-shaped token in the same observation.
+            for tok in line.text.split(whereSeparator: { $0.isWhitespace }) {
+                if let v = priceValue(String(tok)), v > 0 {
+                    candidates.append(Candidate(value: v, y: line.box.y + line.box.height / 2))
+                }
+            }
+            // Same-Y neighbors — Vision often splits the label and its
+            // amount into distinct observations.
+            let cy = line.box.y + line.box.height / 2
+            let tol = max(0.008, line.box.height * 0.9)
+            for (jdx, other) in lines.enumerated() where jdx != idx {
+                let oy = other.box.y + other.box.height / 2
+                guard abs(oy - cy) <= tol else { continue }
+                if let v = priceValue(other.text), v > 0 {
+                    candidates.append(Candidate(value: v, y: oy))
+                }
+            }
+        }
+
+        // Fallback: on receipts where Vision scrambles the layout so the
+        // "BALANCE" label and its "93.16" value end up on totally
+        // different Ys (IMG_7951), the label-adjacency scan misses.
+        // A real grand total almost always prints 2-3 times on a receipt
+        // — BALANCE, PAYMENT AMOUNT confirmation, and a footer copy.
+        // Look for any value that appears ≥ 2 times among price-shaped
+        // observations. These are strong candidates even without a
+        // nearby label.
+        if candidates.isEmpty {
+            var counts: [Decimal: [Double]] = [:]
+            for line in lines {
+                guard let v = priceValue(line.text), v > 0 else { continue }
+                counts[v, default: []].append(line.box.y + line.box.height / 2)
+            }
+            for (v, ys) in counts where ys.count >= 2 {
+                for y in ys {
+                    candidates.append(Candidate(value: v, y: y))
+                }
+            }
+        }
+        guard !candidates.isEmpty else { return receipt }
+
+        // Filter to plausible values:
+        //   * ≥ items_sum (a real total can never be less than the sum
+        //     of its lineitems). Falls back to 0 if we have no items.
+        //   * ≤ a very generous ceiling. A single grocery receipt
+        //     rarely exceeds $10K; anything above is a transaction ID
+        //     chunk we mistook for a price.
+        let lowerBound: Decimal = itemsSum
+        let upperBound: Decimal = 10_000
+        let plausible = candidates.filter { $0.value >= lowerBound && $0.value <= upperBound }
+        guard !plausible.isEmpty else { return receipt }
+
+        // Rank within plausible: closest to arithmetic expected wins.
+        // On receipts where we captured every line item, items_sum + tax
+        // ≈ total exactly. On receipts with missed items, expected
+        // underestimates but the candidate closest to it is still
+        // usually the right one — the wrong one (a card-number chunk,
+        // a savings amount) will be much further off. Tie-break toward
+        // the smaller value.
+        let target: Decimal = expected > 0 ? expected : (itemsSum + taxSum)
+        let best = plausible.min { a, b in
+            let ad = a.value > target ? a.value - target : target - a.value
+            let bd = b.value > target ? b.value - target : target - b.value
+            if ad != bd { return ad < bd }
+            return a.value < b.value
+        }!
+
+        // Only override when the new value beats FM's on arithmetic
+        // fit. If FM's total was hallucinated (not in OCR), it can't
+        // be right regardless of arithmetic — always override.
+        let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
+        let newDiff = best.value > target ? best.value - target : target - best.value
+        guard hallucinated || newDiff < fmDiff else { return receipt }
+
+        receipt.totals.total = best.value
+        receipt.provenance.fieldConfidence["totals.total"] = 0.7
+        return receipt
+    }
+
     private static func correctRegularPriceMistakes(
         receipt input: Receipt,
         lines: [(text: String, box: Receipt.BBox)]
