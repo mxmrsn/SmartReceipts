@@ -532,7 +532,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let items: [Receipt.LineItem] = deduped.map {
             Receipt.LineItem(
                 description: $0.desc,
-                quantity: $0.qty,
+                quantity: Self.normalizedQuantity($0.qty, totalPrice: $0.price),
                 unitPrice: $0.unit,
                 totalPrice: $0.price,
                 category: nil
@@ -1335,7 +1335,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
             items.append(Receipt.LineItem(
                 description: cleaned,
-                quantity: fmMatch?.quantity,
+                quantity: Self.normalizedQuantity(fmMatch?.quantity, totalPrice: p.value),
                 unitPrice: fmMatch?.unitPrice,
                 totalPrice: p.value,
                 category: fmMatch?.category
@@ -1536,7 +1536,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
             newItems.append(Receipt.LineItem(
                 description: cleanedDesc,
-                quantity: nil,
+                quantity: Self.normalizedQuantity(nil, totalPrice: priceValue),
                 unitPrice: nil,
                 totalPrice: priceValue,
                 category: nil
@@ -1849,7 +1849,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             guard let alt = altPrice else { continue }
             receipt.lineItems[i] = Receipt.LineItem(
                 description: item.description,
-                quantity: nil,
+                quantity: Self.normalizedQuantity(nil, totalPrice: alt),
                 unitPrice: nil,
                 totalPrice: alt,
                 category: item.category
@@ -2493,6 +2493,25 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             ))
         }
         return rows
+    }
+
+    /// Normalize a candidate quantity value:
+    ///   * empty (nil) → 1
+    ///   * equals the totalPrice (within 1 cent) → 1
+    ///
+    /// The second case catches FM misreading a weight ("BROCCOLI CROWNS
+    /// 1.15 lb @ $1.00/lb — total $1.15") as a quantity of 1.15 rather
+    /// than a weight of 1.15 lb; and misparsing produce rows where FM
+    /// duplicates the price into the quantity slot.
+    ///
+    /// Returns a non-nil Decimal so downstream forms always display a
+    /// quantity — no ambiguous blank field.
+    private static func normalizedQuantity(_ raw: Decimal?, totalPrice: Decimal) -> Decimal? {
+        guard let q = raw else { return 1 }
+        // qty == totalPrice within 1c is treated as spurious.
+        let diff = q > totalPrice ? q - totalPrice : totalPrice - q
+        if diff < Decimal(0.01) { return 1 }
+        return q
     }
 
     private static func parseDecimal(_ s: String) -> Decimal? {
