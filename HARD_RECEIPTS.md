@@ -88,6 +88,46 @@ Only 1 item extracted from a receipt with several. Layout unknown yet.
 - IMG_1741 Walgreens (conf 0.10)
 - IMG_2171 Madewell (conf 0.10)
 
+## Residual after the 2026-07-22 audit
+
+All 1,183 receipts extract; 1,180 land in the dashboard (2 JPY
+receipts + 1 undated excluded from dollar/time charts). Remaining
+suspects worth a pass:
+
+- **8 receipts with implausible tax** that survived the guards
+  (tax == total, tax ≈ half of total, or tax echoing a fee):
+  IMG_5085, IMG_8567, IMG_7846, IMG_1430, IMG_5502, IMG_2109,
+  IMG_6219, IMG_5255. Mostly small totals where FM cross-wired
+  fields and no OCR label rescued them.
+- **IMG_8142** — printed date unreadable (FM said "2026-03-00", OCR
+  recovery found nothing valid). Honest sentinel; excluded from the
+  time axis. Could fall back to photo EXIF date.
+- **340 receipts below 0.6 confidence** — the honest hard-parse tail
+  (faded thermal paper, crumpled, partial framing). Sorted worst-
+  first in the dashboard's Recent Receipts panel.
+
+## Fixed / no longer flagged (2026-07-22 full-dataset audit)
+
+- **12 receipts with impossible dates** ("2026-09-42" from TJ's
+  "03-15-2026 09:42" time-fusion; future dates) — calendar-valid date
+  validation + OCR date recovery. All recovered real dates.
+- **7 receipts stuck at the "1970-01-01" sentinel** (Ace, Hassett,
+  Target, IKEA...) — `recoverDateFromOCR` found the printed date on
+  every one. Sentinel also now scores as a missing date in confidence.
+- **60 receipts with tax = taxable base** (Target's "CA TAX 9.375% on
+  28.79" pattern) — tax candidates rejected when they echo the
+  subtotal/items-sum or exceed 30% of total.
+- **IMG_3389** ($8,854 "total" from a footer digit-run next to "TOTAL
+  NUMBER OF ITEMS"; real $5.26) — item-count rows excluded from totals
+  labels + whole-dollar-large re-anchoring.
+- **IMG_7260 / IMG_7261** (¥5,160 Japan receipts summed as $5,160) —
+  currency auto-detected as JPY; dashboard keeps non-USD out of dollar
+  sums.
+- **13 receipts failing with "Exceeded model context window"** — FM
+  prompt now budgeted + retried with thinned rows on overflow. 12 of
+  13 extract; IMG_1204 additionally needed the lexer-based truncation
+  salvage (FM output cut mid-string at an escaped quote).
+
 ## Fixed / no longer flagged
 
 - IMG_5785 (Grocery Outlet on wooden table, rotated 90°) — now extracts
