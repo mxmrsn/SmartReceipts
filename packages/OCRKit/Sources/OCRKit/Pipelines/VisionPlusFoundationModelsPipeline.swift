@@ -163,16 +163,40 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // the actual price was $7.77 on a different row).
             .filter { !Self.rowContainsHardMetadataMarker($0) }
             .map(Self.stripTrailingSingleLetterSegment)
-        let spatialOCR = rows.enumerated().map { idx, row in
-            let yPct = Int((row.meanY * 100).rounded())
-            return String(format: "[R%02d y=%02d] %@", idx, yPct, row.joined)
-        }.joined(separator: "\n")
-
-        let session = LanguageModelSession(instructions: Self.instructions)
-        let prompt = "Receipt OCR, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and are listed left-to-right; on a line-item row the rightmost segment is almost always the price.\n\n\(spatialOCR)\n\nReturn ONLY the JSON object."
-
-        if ProcessInfo.processInfo.environment["OCR_DEBUG_PROMPT"] != nil {
-            FileHandle.standardError.write(Data("=== FM PROMPT ===\n\(spatialOCR)\n=== END ===\n".utf8))
+        func renderPrompt(_ rs: [OCRRow]) -> String {
+            rs.enumerated().map { idx, row in
+                let yPct = Int((row.meanY * 100).rounded())
+                return String(format: "[R%02d y=%02d] %@", idx, yPct, row.joined)
+            }.joined(separator: "\n")
+        }
+        // Budget the FM prompt. Apple's on-device model shares one fixed
+        // context across input + output; very long receipts (Costco-
+        // length, multi-fold) overflow it and the WHOLE extraction dies
+        // with "Exceeded model context window size". Column-anchored
+        // item extraction reads the full OCR line set independently of
+        // this prompt, so FM only needs the edges (merchant + date at
+        // the top, totals + payment at the bottom) and a representative
+        // slice of items. Compact in two stages:
+        //   1. Drop footer rows past the last money-bearing row
+        //      (surveys, rewards marketing, store hours) — minus a
+        //      small margin for the payment/date block.
+        //   2. Thin item rows from the MIDDLE until the prompt fits.
+        //      Middle rows are the most redundant: FM's items are only
+        //      a hint source; totals sanity + column extraction carry
+        //      the real signal.
+        var promptRows = rows
+        let promptBudget = 7000
+        if renderPrompt(promptRows).count > promptBudget {
+            func rowHasMoney(_ row: OCRRow) -> Bool {
+                row.joined.range(of: #"\d+[.,]\d{2}\b"#, options: .regularExpression) != nil
+            }
+            if let lastMoney = promptRows.lastIndex(where: rowHasMoney) {
+                let keepEnd = min(promptRows.count, lastMoney + 5)
+                promptRows = Array(promptRows[..<keepEnd])
+            }
+            while renderPrompt(promptRows).count > promptBudget, promptRows.count > 24 {
+                promptRows.remove(at: promptRows.count / 2)
+            }
         }
 
         // Apple's on-device FM has a fixed total context (input + output).
@@ -188,13 +212,44 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             maximumResponseTokens: 1500
         )
 
-        let rawResponse: String
-        do {
-            let response = try await session.respond(to: prompt, options: options)
-            rawResponse = response.content
-        } catch {
+        // Token budgets are unpredictable from character counts alone —
+        // digit-heavy receipt text tokenizes far denser than prose (a
+        // 2.7 KB Sprouts prompt overflowed the window). So besides the
+        // proactive character budget above, retry reactively: on a
+        // context-window error, thin the middle rows and try again with
+        // a FRESH session (a session accumulates transcript state, so
+        // reusing one after a failure compounds the overflow).
+        var attemptRows = promptRows
+        var rawResponseOpt: String? = nil
+        var lastError: Error? = nil
+        for _ in 0..<3 {
+            let attemptOCR = renderPrompt(attemptRows)
+            let prompt = "Receipt OCR, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and are listed left-to-right; on a line-item row the rightmost segment is almost always the price.\n\n\(attemptOCR)\n\nReturn ONLY the JSON object."
+            if ProcessInfo.processInfo.environment["OCR_DEBUG_PROMPT"] != nil {
+                FileHandle.standardError.write(Data("=== FM PROMPT ===\n\(attemptOCR)\n=== END ===\n".utf8))
+            }
+            let session = LanguageModelSession(instructions: Self.instructions)
+            do {
+                let response = try await session.respond(to: prompt, options: options)
+                rawResponseOpt = response.content
+                break
+            } catch {
+                lastError = error
+                let msg = error.localizedDescription.lowercased()
+                guard msg.contains("context window"), attemptRows.count > 16 else { break }
+                // Drop the middle 40% of rows and retry. Header rows
+                // (merchant, date) and trailing rows (totals, payment)
+                // survive; the dropped items are recovered by column-
+                // anchored extraction from the full OCR line set.
+                let target = max(16, (attemptRows.count * 6) / 10)
+                while attemptRows.count > target {
+                    attemptRows.remove(at: attemptRows.count / 2)
+                }
+            }
+        }
+        guard let rawResponse = rawResponseOpt else {
             throw OCRError.parseFailed(
-                "Foundation Models generation failed: \(error.localizedDescription)"
+                "Foundation Models generation failed: \(lastError?.localizedDescription ?? "unknown error")"
             )
         }
         if ProcessInfo.processInfo.environment["OCR_DEBUG_FM"] != nil {
@@ -229,6 +284,19 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // and column-anchored would pick them as if they were items.
         let postLines = Self.normalizePriceTokens(Self.mergeSplitPriceFragments(lines))
         var receipt = Self.buildReceipt(from: extracted, ocrLines: postLines)
+        // Currency correction: FM defaults to USD, but travel receipts
+        // slip in ("TOTAL YEN", "¥5160" — a ¥5,160 konbini receipt was
+        // landing in the dataset as $5,160 with full confidence).
+        // Detect yen markers in the OCR and relabel before the totals
+        // sanity checks run — integer totals are NORMAL for JPY, so the
+        // whole-dollar-artifact guard must know the real currency.
+        if receipt.header.currency == "USD" {
+            let joined = lines.map(\.text).joined(separator: " ")
+            if joined.contains("¥")
+                || joined.range(of: #"\b(?i:yen|jpy)\b"#, options: .regularExpression) != nil {
+                receipt.header.currency = "JPY"
+            }
+        }
         // PRIMARY line-item extraction: scan the price column directly.
         // The OCR data unambiguously tells us where the prices are. FM's
         // strength is reading text (merchant name, date, totals labels);
@@ -356,6 +424,139 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         )
     }
 
+    // MARK: - Date validation + recovery
+
+    /// Today's date as "YYYY-MM-DD". ISO strings compare correctly with
+    /// plain string ordering, which is all the plausibility checks need.
+    private static func todayISO() -> String {
+        let comps = Calendar(identifier: .gregorian).dateComponents([.year, .month, .day], from: Date())
+        return String(format: "%04d-%02d-%02d", comps.year ?? 0, comps.month ?? 0, comps.day ?? 0)
+    }
+
+    /// Strict validation of an FM-emitted date. Returns the normalized
+    /// "YYYY-MM-DD" string, or nil if the value is malformed, not a real
+    /// calendar date (month 13, day 42), in the future, or implausibly
+    /// old for a personal receipt library (> 10 years back).
+    ///
+    /// The calendar-validity check matters in practice: FM fuses the
+    /// printed time into the day slot ("03-15-2026 09:42" → "2026-09-42")
+    /// often enough that shape-only validation lets junk through.
+    static func validatedISODate(_ raw: String) -> String? {
+        let d = raw.trimmingCharacters(in: .whitespaces)
+        guard d.range(of: #"^(19|20)\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let parts = d.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return validatedDateComponents(year: parts[0], month: parts[1], day: parts[2])
+    }
+
+    /// Shared plausibility gate: real month, real day-of-month (leap
+    /// years handled), within [today - 10 years, today].
+    private static func validatedDateComponents(year: Int, month: Int, day: Int) -> String? {
+        guard (1...12).contains(month) else { return nil }
+        let daysInMonth: Int = {
+            switch month {
+            case 1, 3, 5, 7, 8, 10, 12: return 31
+            case 4, 6, 9, 11: return 30
+            default:
+                let isLeap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+                return isLeap ? 29 : 28
+            }
+        }()
+        guard (1...daysInMonth).contains(day) else { return nil }
+        let iso = String(format: "%04d-%02d-%02d", year, month, day)
+        let today = todayISO()
+        guard iso <= today else { return nil }
+        let currentYear = Int(today.prefix(4)) ?? 0
+        guard year >= currentYear - 10 else { return nil }
+        return iso
+    }
+
+    /// Scan OCR observations (already sorted top-to-bottom) for a
+    /// date-shaped token and return the first plausible one as
+    /// "YYYY-MM-DD". Handles the formats receipts actually print:
+    ///   12/17/23 08:50        (US M/D/YY + time)
+    ///   11/06/24              (US M/D/YY)
+    ///   03-15-2026 09:42      (US M-D-YYYY + time)
+    ///   2025/09/08 14:51:30   (ISO-ish Y/M/D + time)
+    ///   Wednesday, 16 October, 2024 02:22 PM
+    ///   Oct 16, 2024
+    /// Candidates failing the plausibility gate (month 13, future date,
+    /// ancient date) are skipped, so a stray SKU or phone number can't
+    /// win — those digit runs virtually never form a valid recent date.
+    static func recoverDateFromOCR(_ lines: [(text: String, box: Receipt.BBox)]) -> String? {
+        let monthNames: [String: Int] = [
+            "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+            "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+        ]
+        // (pattern, group order) — group order maps regex capture groups
+        // to (year, month, day) positions.
+        struct DatePattern {
+            let regex: NSRegularExpression
+            let order: (y: Int, m: Int, d: Int)  // capture-group indices
+            let twoDigitYear: Bool
+        }
+        let patternSpecs: [(String, (y: Int, m: Int, d: Int), Bool)] = [
+            // 2025/09/08, 2025-09-08, 2025.09.08
+            (#"\b(20\d{2})[/\-\.](\d{1,2})[/\-\.](\d{1,2})\b"#, (1, 2, 3), false),
+            // 03/15/2026, 03-15-2026
+            (#"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](20\d{2})\b"#, (3, 1, 2), false),
+            // 12/17/23 — two-digit year, assume 20YY
+            (#"\b(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2})\b"#, (3, 1, 2), true),
+        ]
+        var numericPatterns: [DatePattern] = []
+        for spec in patternSpecs {
+            guard let re = try? NSRegularExpression(pattern: spec.0) else { continue }
+            numericPatterns.append(DatePattern(regex: re, order: spec.1, twoDigitYear: spec.2))
+        }
+        // "October 16, 2024" / "Oct 16 2024"
+        let monthFirstRe = try? NSRegularExpression(
+            pattern: #"\b([A-Za-z]{3,9})\.?\s+(\d{1,2})\s*,?\s+(20\d{2})\b"#)
+        // "16 October, 2024" / "16 Oct 2024"
+        let dayFirstRe = try? NSRegularExpression(
+            pattern: #"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s*,?\s+(20\d{2})\b"#)
+
+        func group(_ match: NSTextCheckingResult, _ i: Int, in text: String) -> String? {
+            guard let r = Range(match.range(at: i), in: text) else { return nil }
+            return String(text[r])
+        }
+
+        for line in lines {
+            let text = line.text
+            let full = NSRange(text.startIndex..<text.endIndex, in: text)
+            for pat in numericPatterns {
+                for match in pat.regex.matches(in: text, options: [], range: full) {
+                    guard
+                        let ys = group(match, pat.order.y, in: text),
+                        let ms = group(match, pat.order.m, in: text),
+                        let ds = group(match, pat.order.d, in: text),
+                        var y = Int(ys), let m = Int(ms), let d = Int(ds)
+                    else { continue }
+                    if pat.twoDigitYear { y += 2000 }
+                    if let iso = validatedDateComponents(year: y, month: m, day: d) {
+                        return iso
+                    }
+                }
+            }
+            for (re, monthGroup, dayGroup) in [(monthFirstRe, 1, 2), (dayFirstRe, 2, 1)] {
+                guard let re else { continue }
+                for match in re.matches(in: text, options: [], range: full) {
+                    guard
+                        let name = group(match, monthGroup, in: text)?.lowercased().prefix(3),
+                        let month = monthNames[String(name)],
+                        let ds = group(match, dayGroup, in: text), let d = Int(ds),
+                        let ys = group(match, 3, in: text), let y = Int(ys)
+                    else { continue }
+                    if let iso = validatedDateComponents(year: y, month: month, day: d) {
+                        return iso
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
     // MARK: - Confidence scoring
 
     /// Compute a 0.0–1.0 receipt-level confidence from structural signals.
@@ -419,12 +620,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             if total > 3 { score -= 0.15 }
         }
 
-        // Date parsed.
+        // Date parsed AND plausible. The "1970-01-01" sentinel means "no
+        // valid date found" — it must score as missing, not as a valid
+        // date (it's shaped like one, which fooled the earlier check and
+        // let undated receipts report confidence 1.0).
         let dateValue = receipt.header.date.value
-        if dateValue.count == 10, dateValue.contains("-") {
-            score += 0.05
-        } else {
+        if dateValue == "1970-01-01" || validatedISODate(dateValue) == nil {
             score -= 0.10
+        } else {
+            score += 0.05
         }
 
         // Merchant identified.
@@ -456,28 +660,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // misread and a subtotal / balance value ended up there.
         if total > 0, tax > total * 0.5 { score -= 0.20 }
 
-        // Future date — we've seen the LLM sometimes pattern-match a
-        // "22/07/2027"-shaped random string as a date. Not real.
-        if dateValue > isoTodayPlusTenYears() {
-            score -= 0.15
-        }
-
         return max(0.0, min(1.0, score))
     }
 
     private static func doubleValue(_ d: Decimal) -> Double {
         NSDecimalNumber(decimal: d).doubleValue
-    }
-
-    /// Bound used to flag obviously-hallucinated dates. Not intended to be
-    /// exact — just "clearly in the far future" — so we compute it against
-    /// a fixed reference year rather than `Date()` (avoids nondeterminism
-    /// in tests / benches).
-    private static func isoTodayPlusTenYears() -> String {
-        // Any date past this string reads as "certainly hallucinated".
-        // Bumping the year here every decade is fine — we're gating
-        // against pattern-matched garbage, not enforcing a real deadline.
-        return "2036-01-01"
     }
 
     // MARK: - Instructions
@@ -612,25 +799,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             return c.isEmpty ? "USD" : c
         }()
 
-        let dateValue: String = {
-            let d = x.date.trimmingCharacters(in: .whitespaces)
-            // Year locked to 19xx/20xx so a 2-digit-year misread like
-            // "0024" → "0024-02-04" doesn't sneak past the canonical schema.
-            guard d.range(of: #"^(19|20)\d{2}-\d{2}-\d{2}$"#, options: .regularExpression) != nil else {
-                return "1970-01-01"
-            }
-            // Plausibility: receipts are never from the future and almost
-            // never more than ~10 years old in a labeling workflow. We've
-            // seen FM hallucinate "2024-09-19" for a clearly-2023 receipt.
-            // Returning the sentinel triggers the labeler's EXIF-date
-            // fallback path, which is much more reliable than guessing.
-            let year = Int(d.prefix(4)) ?? 0
-            let currentYear = Calendar.current.component(.year, from: Date())
-            if year < currentYear - 10 || year > currentYear + 1 {
-                return "1970-01-01"
-            }
-            return d
-        }()
+        // Validate FM's date (calendar-valid, not future, not ancient).
+        // FM misassembles dates in specific ways we've seen in the wild:
+        // Trader Joe's prints "03-15-2026 09:42" and FM emitted
+        // "2026-09-42" — the YEAR fused with the TIME. When validation
+        // rejects, recover by scanning the OCR text for a date-shaped
+        // token; receipts nearly always print the transaction date, FM
+        // just failed to assemble it. Sentinel only as a last resort.
+        let dateValue: String =
+            Self.validatedISODate(x.date)
+            ?? Self.recoverDateFromOCR(ocrLines)
+            ?? "1970-01-01"
 
         var fieldConf: [String: Double] = [:]
         let merchant = x.merchantName.trimmingCharacters(in: .whitespaces)
@@ -855,20 +1034,65 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// (e.g. no `"lineItems"` key), so the caller can re-raise the
     /// original parse error rather than papering over it.
     private static func salvageTruncatedJSON(_ json: String) -> String? {
-        guard let itemsStart = json.range(of: "\"lineItems\"")?.upperBound else { return nil }
-        // Find the last "}," in the lineItems region. That's the boundary
-        // after the last complete line-item object.
-        let afterItems = json[itemsStart...]
-        guard let lastBoundary = afterItems.range(of: "},", options: .backwards) else {
-            // No complete items in the array yet — close it empty.
-            // First make sure the prefix up to the array opening is sane.
-            guard let arrayOpen = afterItems.range(of: "[") else { return nil }
-            let head = String(json[..<arrayOpen.upperBound])
-            return head + "]}"
+        // Walk the string with a minimal JSON lexer (string / escape /
+        // depth state) and remember the last offset where a line-item
+        // object closed cleanly — i.e. a '}' that returns depth to the
+        // lineItems-array level. Truncate there and close the array +
+        // root object. A lexer is necessary: naive "}," searches break
+        // when the model output was cut mid-string, contains escaped
+        // quotes ('24\" PLANT PROP'), or braces inside descriptions.
+        guard let itemsKey = json.range(of: "\"lineItems\"") else { return nil }
+
+        var inString = false
+        var escaped = false
+        var depth = 0
+        var arrayDepthAtItems: Int? = nil     // depth just after '[' of lineItems
+        var lastCompleteItemEnd: String.Index? = nil
+        var sawItemsArray = false
+
+        var i = json.startIndex
+        while i < json.endIndex {
+            let c = json[i]
+            if inString {
+                if escaped {
+                    escaped = false
+                } else if c == "\\" {
+                    escaped = true
+                } else if c == "\"" {
+                    inString = false
+                }
+            } else {
+                switch c {
+                case "\"": inString = true
+                case "{", "[":
+                    depth += 1
+                    if c == "[", !sawItemsArray, i > itemsKey.upperBound {
+                        sawItemsArray = true
+                        arrayDepthAtItems = depth
+                    }
+                case "}", "]":
+                    depth -= 1
+                    // A '}' that lands back on the lineItems array depth
+                    // is the clean end of one complete item object.
+                    if c == "}", let ad = arrayDepthAtItems, depth == ad {
+                        lastCompleteItemEnd = i
+                    }
+                default: break
+                }
+            }
+            i = json.index(after: i)
         }
-        // Keep through the closing `}` of the last item (drop the trailing `,`)
-        let kept = json[..<lastBoundary.lowerBound] + "}"
-        return String(kept) + "]}"
+
+        guard sawItemsArray else { return nil }
+        if let end = lastCompleteItemEnd {
+            return String(json[...end]) + "]}"
+        }
+        // No complete item survived — close the array empty so at least
+        // merchant / date / totals make it through.
+        guard let arrayOpen = json.range(of: "[", range: itemsKey.upperBound..<json.endIndex) else {
+            return nil
+        }
+        return String(json[..<arrayOpen.upperBound]) + "]}"
     }
 
     /// Strip Markdown code fences and stray prose around the JSON object.
@@ -2169,8 +2393,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         //      to tax). Clear it.
         let extractedTax = receipt.totals.tax.first?.amount ?? 0
         let taxLabel = findLabel(matching: ["tax", "sales tax", "vat", "gst", "hst"])
+        let itemsSumForTax: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
         if let label = taxLabel, let v = findPairedValue(labelObs: label),
-           v > 0, v < receipt.totals.total, v != extractedTax {
+           v > 0, v != extractedTax,
+           // Tax plausibility. Target prints "T = CA TAX 9.375% on 28.79"
+           // — the 28.79 is the TAXABLE BASE, not the tax, and it sits
+           // right on the label row. Reject any candidate that (a) echoes
+           // the subtotal / items sum or (b) exceeds 30% of the total —
+           // no US sales tax comes anywhere near that; a value that big
+           // is always a base amount or a misread.
+           v != (receipt.totals.subtotal ?? -1),
+           v != itemsSumForTax,
+           v <= receipt.totals.total * Decimal(0.3) {
             receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: nil, amount: v)]
             receipt.provenance.fieldConfidence["totals.tax"] = 0.75
         } else if taxLabel == nil,
@@ -2279,7 +2513,19 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             && fmTotal < Decimal(50)
             && fmTotal < itemsSum
 
-        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount else { return receipt }
+        // Flag 5: a large whole-dollar total with no cents. US receipts
+        // essentially always print cents on the grand total; a candidate
+        // like "8854" is a transaction-ID / store-number digit run that
+        // happened to sit near a "TOTAL ..." row (IMG_3389: real total
+        // $5.26, FM picked the "8854" footer artifact). Yen receipts DO
+        // print integer totals, so skip when the currency isn't dollar-
+        // denominated.
+        let wholeDollarLarge =
+            isWholeInteger
+            && fmTotal >= Decimal(200)
+            && receipt.header.currency == "USD"
+
+        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount || wholeDollarLarge else { return receipt }
 
         // Gather grand-total candidates: any price observation on a row
         // whose text starts with a "grand-total" keyword. We accept
@@ -2304,6 +2550,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         func isTotalsLabel(_ text: String) -> Bool {
             let stripped = normalizeForKeyword(text)
+            // Item-COUNT rows start with "total" but their number is a
+            // count, not money ("TOTAL NUMBER OF ITEMS 5 6", "Items in
+            // Transaction: 13"). Treating them as totals labels let the
+            // adjacent digit-run win candidate selection on IMG_3389.
+            let countMarkers = [
+                "number of items", "items in transaction",
+                "item count", "items sold", "total items",
+            ]
+            if countMarkers.contains(where: { stripped.contains($0) }) { return false }
             for kw in grandTotalKeywords {
                 if stripped == kw { return true }
                 if stripped.hasPrefix(kw + " ") { return true }
@@ -2413,7 +2668,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         //     run misread). Always replace with something reasonable.
         //   * Otherwise — require the replacement to beat FM on
         //     arithmetic fit. Not currently reachable but future-proof.
-        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge && !looksLikeItemCount {
+        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge && !looksLikeItemCount && !wholeDollarLarge {
             let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
             let newDiff = best.value > target ? best.value - target : target - best.value
             guard newDiff < fmDiff else { return receipt }
