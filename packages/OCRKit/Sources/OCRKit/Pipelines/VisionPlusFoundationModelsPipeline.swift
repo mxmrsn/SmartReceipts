@@ -1217,12 +1217,22 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
 
         // Step 1: every price-shaped observation with its value.
+        // Also flag whether the observation carried a tax-category
+        // marker ("4.79 S", "7.99 B") — Safeway prints both an
+        // actual paid price WITH marker and a regular price WITHOUT
+        // marker for every item; the marker tells us which is the
+        // one that was actually charged.
         struct PricePoint {
             let value: Decimal
             let box: Receipt.BBox
             let centerY: Double
             let lineIdx: Int
+            let hasTaxMarker: Bool
         }
+        let taxMarkerSuffix = try? NSRegularExpression(
+            pattern: #"\d\s+[A-Z]\s*$"#,
+            options: []
+        )
         var pricePoints: [PricePoint] = []
         for (idx, line) in lines.enumerated() {
             let trimmed = line.text.trimmingCharacters(in: .whitespaces)
@@ -1233,11 +1243,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
             guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
             guard v > 0 else { continue }
+            var marker = false
+            if let re = taxMarkerSuffix {
+                let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+                marker = re.firstMatch(in: trimmed, options: [], range: range) != nil
+            }
             pricePoints.append(PricePoint(
                 value: v,
                 box: line.box,
                 centerY: line.box.y + line.box.height / 2,
-                lineIdx: idx
+                lineIdx: idx,
+                hasTaxMarker: marker
             ))
         }
         guard pricePoints.count >= 2 else { return [] }
@@ -1279,9 +1295,59 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
 
         // Step 5–7: walk surviving prices in Y order.
-        let inColumn = pricePoints
+        let inColumnRaw = pricePoints
             .filter { columnLo <= $0.box.x && $0.box.x <= columnHi }
             .sorted { $0.centerY < $1.centerY }
+
+        // Safeway (and some other chains) print BOTH the actual paid
+        // price AND the regular price for every item, stacked in the
+        // same column just a few points apart:
+        //     4.79 S     ← actual paid price (S = tax marker)
+        //     4.79       ← regular price (no marker)
+        //     MRTN CRSE SEA SLT
+        // Or for discounted items:
+        //     4.49 S     ← actual paid ($4.49)
+        //     4.99       ← regular ($4.99, marked down $0.50)
+        //     TRPCNA OJ
+        // Column-anchored extraction was picking up BOTH prices,
+        // doubling every item in the extracted list (IMG_5591 turned
+        // 5 real items into 10, sum inflated $21 → $43). Dedupe by
+        // scanning pairs of consecutive prices in the column: if
+        // they're within 0.012 Y of each other, they're the paired
+        // "actual/regular" and only one should survive. Preference:
+        //   1. keep the price WITH a tax marker (S/T/B/F/N — that's
+        //      the paid line)
+        //   2. tiebreak toward the SMALLER value (the discounted
+        //      paid amount is less than the regular)
+        var inColumn: [PricePoint] = []
+        var i = 0
+        while i < inColumnRaw.count {
+            let cur = inColumnRaw[i]
+            if i + 1 < inColumnRaw.count {
+                let nxt = inColumnRaw[i + 1]
+                let dy = abs(nxt.centerY - cur.centerY)
+                // 0.005 threshold — Safeway's actual/regular pairs sit
+                // 0.001–0.003 apart (visually the same line, different
+                // OCR baselines), while distinct items on other layouts
+                // (Target IMG_6855) are 0.012+ apart. A stricter gate
+                // keeps the dedup targeted at genuine pairs.
+                if dy < 0.005 {
+                    // A pair. Keep whichever has the tax marker; if
+                    // both/neither have markers, keep the smaller
+                    // value (the paid price).
+                    let keeper: PricePoint = {
+                        if cur.hasTaxMarker && !nxt.hasTaxMarker { return cur }
+                        if !cur.hasTaxMarker && nxt.hasTaxMarker { return nxt }
+                        return cur.value <= nxt.value ? cur : nxt
+                    }()
+                    inColumn.append(keeper)
+                    i += 2
+                    continue
+                }
+            }
+            inColumn.append(cur)
+            i += 1
+        }
 
         var items: [Receipt.LineItem] = []
         for p in inColumn {
@@ -1805,15 +1871,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // Flag 1: FM's total is hallucinated (not in OCR at all).
         let hallucinated = !fmTotalPresent
 
-        // Flag 2: items_sum >> total × 3 suggests FM picked a tiny
+        // Flag 2: items_sum >> total × 2 suggests FM picked a tiny
         // value (item count "12", small savings amount) instead of
-        // the real total. The × 3 threshold (up from × 2) avoids
-        // firing on receipts where items are just moderately over-
-        // extracted; when items are legitimately overpriced vs the
-        // total by only 2× it's often the SUM that's wrong, not FM.
+        // the real total. Post-dedup, items_sum is reliable enough
+        // that a 2× ratio is meaningful evidence FM is wrong.
+        // (Previously we tried × 3 to avoid firing on receipts
+        // where items were legit 2× the total due to over-
+        // extraction — but that class of false positive is now
+        // gone since column-anchored extraction dedupes
+        // actual/regular price pairs before items_sum is computed.)
         let savingsBlockConfusion =
             receipt.lineItems.count >= 3
-            && itemsSum > fmTotal * Decimal(3)
+            && itemsSum > fmTotal * Decimal(2)
 
         // Flag 3: fmTotal implausibly large vs items — 5× or more.
         // IMG_5353 landed on $8851 for an 11-item Safeway; that's a
@@ -1825,7 +1894,26 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             && fmTotal > itemsSum * Decimal(5)
             && itemsSum > 0
 
-        guard hallucinated || savingsBlockConfusion || implausiblyLarge else { return receipt }
+        // Flag 4: fmTotal is a small whole-number and less than
+        // items_sum — highly suspicious that FM picked the item
+        // COUNT ("TOTAL NUMBER OF ITEMS SOLD = 15") instead of the
+        // real dollar total. Real totals almost always have cents
+        // (dollars.cents format); a small whole-number total is
+        // suspect. Threshold at $50 so we don't misfire on the
+        // occasional legit round-dollar amount, and require ≥ 3
+        // items so we're confident there's a real receipt to
+        // compare against.
+        var fmTotalRounded: Decimal = 0
+        var fmTotalMut = fmTotal
+        NSDecimalRound(&fmTotalRounded, &fmTotalMut, 0, .down)
+        let isWholeInteger = fmTotalRounded == fmTotal
+        let looksLikeItemCount =
+            receipt.lineItems.count >= 3
+            && isWholeInteger
+            && fmTotal < Decimal(50)
+            && fmTotal < itemsSum
+
+        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount else { return receipt }
 
         // Gather grand-total candidates: any price observation on a row
         // whose text starts with a "grand-total" keyword. We accept
@@ -1959,7 +2047,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         //     run misread). Always replace with something reasonable.
         //   * Otherwise — require the replacement to beat FM on
         //     arithmetic fit. Not currently reachable but future-proof.
-        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge {
+        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge && !looksLikeItemCount {
             let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
             let newDiff = best.value > target ? best.value - target : target - best.value
             guard newDiff < fmDiff else { return receipt }
@@ -2183,6 +2271,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             "member", "regular", "savings", "discounts", "discount",
             "rewards", "coupon", "additional", "balance", "subtotal",
             "tax", "tip", "total", "change", "redeemed",
+            // Column-header fragments — Safeway prints "You Pay" +
+            // "Price" as a two-line header above the item block, and
+            // the "Price" observation can get picked as a description
+            // for the first item.
+            "price", "amount", "qty", "item", "you", "pay",
             // Safeway-specific column markers — appear in the price
             // column area at random Ys and confuse recovery.
             "vol", "vol+", "vol-", "wt", "info",
