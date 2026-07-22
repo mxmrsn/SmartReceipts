@@ -313,12 +313,17 @@
     </div>
   </div>
 
-  <div class="panel c-12">
+  <div class="panel c-8">
     <h3>Repeat Product <span class="helper">price over time</span>
       <select id="productPicker" style="margin-left:14px"></select>
     </h3>
     <svg id="chartProduct" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
     <div id="productMeta" style="color:var(--text-dim);font-size:12px;margin-top:8px;"></div>
+  </div>
+  <div class="panel c-4">
+    <h3>Weekday Pattern <span class="helper">visits by day</span></h3>
+    <svg id="chartDow" viewBox="0 0 300 220"></svg>
+    <div id="dowMeta" style="color:var(--text-dim);font-size:12px;margin-top:8px;"></div>
   </div>
 </div>
 
@@ -721,6 +726,55 @@ document.querySelectorAll('#viewToggle button').forEach(btn => {
   });
 });
 
+// Weekday visit pattern (bars) — helpful when scoped to one merchant
+// via the product picker chain (Philz on weekdays vs weekends, etc).
+function renderDow() {
+  const svg = document.getElementById('chartDow');
+  const meta = document.getElementById('dowMeta');
+  svg.innerHTML = '';
+  meta.textContent = '';
+  const dowNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const counts = [0, 0, 0, 0, 0, 0, 0];
+  const spend = [0, 0, 0, 0, 0, 0, 0];
+  for (const r of data) {
+    const d = parseDate(r.date);
+    if (isNaN(d.getTime())) continue;
+    counts[d.getDay()]++;
+    spend[d.getDay()] += r.total;
+  }
+  const maxV = Math.max(...counts) || 1;
+  const W = 300, H = 220;
+  const padL = 32, padR = 12, padT = 12, padB = 28;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const step = innerW / 7;
+  const barW = step * 0.6;
+
+  for (let i = 0; i < 7; i++) {
+    const dowIdx = (i + 1) % 7;         // start on Monday for a work-week feel
+    const barH = innerH * counts[dowIdx] / maxV;
+    const x = padL + i * step + (step - barW) / 2;
+    const y = padT + innerH - barH;
+    svg.insertAdjacentHTML('beforeend',
+      `<rect class="bar" x="${x}" y="${y}" width="${barW}" height="${barH}" rx="2" opacity="0.85">
+        <title>${dowNames[dowIdx]}: ${counts[dowIdx]} visits · ${fmtMoney(spend[dowIdx])}</title>
+      </rect>`
+    );
+    svg.insertAdjacentHTML('beforeend',
+      `<text class="axis-text" x="${x + barW / 2}" y="${H - 8}" text-anchor="middle">${dowNames[dowIdx]}</text>`
+    );
+    if (counts[dowIdx] > 0) {
+      svg.insertAdjacentHTML('beforeend',
+        `<text class="axis-text" x="${x + barW / 2}" y="${y - 4}" text-anchor="middle" fill="var(--text-dim)">${counts[dowIdx]}</text>`
+      );
+    }
+  }
+  const peakIdx = counts.indexOf(Math.max(...counts));
+  if (Math.max(...counts) > 0) {
+    meta.textContent = `${dowNames[peakIdx]} is the most common shopping day (${counts[peakIdx]} visits · ${fmtMoney(spend[peakIdx])} spent).`;
+  }
+}
+
 // ----- Boot -----
 function render() {
   updateStats();
@@ -729,6 +783,7 @@ function render() {
   renderMerchants();
   renderRecent();
   renderProductPicker();
+  renderDow();
 }
 render();
 </script>
