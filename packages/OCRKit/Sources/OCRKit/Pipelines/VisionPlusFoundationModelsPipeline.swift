@@ -1805,14 +1805,27 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // Flag 1: FM's total is hallucinated (not in OCR at all).
         let hallucinated = !fmTotalPresent
 
-        // Flag 2: items_sum >> total × 2 suggests FM picked a small
-        // savings/discount value instead of the real total. Only fires
-        // when we have enough items to trust items_sum.
+        // Flag 2: items_sum >> total × 3 suggests FM picked a tiny
+        // value (item count "12", small savings amount) instead of
+        // the real total. The × 3 threshold (up from × 2) avoids
+        // firing on receipts where items are just moderately over-
+        // extracted; when items are legitimately overpriced vs the
+        // total by only 2× it's often the SUM that's wrong, not FM.
         let savingsBlockConfusion =
             receipt.lineItems.count >= 3
-            && itemsSum > fmTotal * Decimal(2)
+            && itemsSum > fmTotal * Decimal(3)
 
-        guard hallucinated || savingsBlockConfusion else { return receipt }
+        // Flag 3: fmTotal implausibly large vs items — 5× or more.
+        // IMG_5353 landed on $8851 for an 11-item Safeway; that's a
+        // digit-run misread (probably a card number or transaction ID
+        // Vision concatenated). Real totals for small item counts
+        // don't blow past items_sum × 5.
+        let implausiblyLarge =
+            receipt.lineItems.count >= 3
+            && fmTotal > itemsSum * Decimal(5)
+            && itemsSum > 0
+
+        guard hallucinated || savingsBlockConfusion || implausiblyLarge else { return receipt }
 
         // Gather grand-total candidates: any price observation on a row
         // whose text starts with a "grand-total" keyword. We accept
@@ -1894,26 +1907,43 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
         guard !candidates.isEmpty else { return receipt }
 
-        // Filter to plausible values:
-        //   * ≥ items_sum (a real total can never be less than the sum
-        //     of its lineitems). Falls back to 0 if we have no items.
-        //   * ≤ a very generous ceiling. A single grocery receipt
-        //     rarely exceeds $10K; anything above is a transaction ID
-        //     chunk we mistook for a price.
-        let lowerBound: Decimal = itemsSum
-        let upperBound: Decimal = 10_000
+        // Filter to plausible values. Both a lower AND upper bound
+        // relative to items_sum:
+        //   * Lower bound of items_sum × 0.3 — the real total is
+        //     often less than items_sum (over-extracted lines) but
+        //     rarely more than 3× smaller. Below that is almost
+        //     always a savings amount or per-unit price.
+        //   * Upper bound of max(items_sum × 5, $200) — bounds the
+        //     ceiling against digit-run misreads ("8893" adjacent to
+        //     "TOTAL NUMBER OF ITEMS SOLD" got picked up as a
+        //     candidate). $200 floor lets sparse extractions still
+        //     find their real totals.
+        let lowerBound: Decimal = itemsSum > 0 ? itemsSum * Decimal(0.3) : 0
+        let upperBoundBase: Decimal = itemsSum > 0 ? itemsSum * Decimal(5) : Decimal(10_000)
+        let upperBound: Decimal = max(upperBoundBase, Decimal(200))
         let plausible = candidates.filter { $0.value >= lowerBound && $0.value <= upperBound }
         guard !plausible.isEmpty else { return receipt }
 
-        // Rank within plausible: closest to arithmetic expected wins.
-        // On receipts where we captured every line item, items_sum + tax
-        // ≈ total exactly. On receipts with missed items, expected
-        // underestimates but the candidate closest to it is still
-        // usually the right one — the wrong one (a card-number chunk,
-        // a savings amount) will be much further off. Tie-break toward
+        // Rank the plausible candidates by "closest to arithmetic
+        // target" — either items_sum + tax (when items look reliable)
+        // or just the max of items_sum and the median candidate value
+        // (when items may be over/under-extracted). Ties break toward
         // the smaller value.
-        let target: Decimal = expected > 0 ? expected : (itemsSum + taxSum)
-        let best = plausible.min { a, b in
+        //
+        // We ALSO score against the median plausible candidate: real
+        // totals are typically the value that appears multiple times
+        // (BALANCE + PAYMENT AMOUNT + footer), so the mode/median of
+        // the label-anchored set is a strong signal even when
+        // arithmetic is off.
+        let sortedVals = plausible.map(\.value).sorted()
+        let candidateMedian = sortedVals[sortedVals.count / 2]
+        let target: Decimal = {
+            if expected > 0 { return expected }
+            if itemsSum > 0 { return max(itemsSum + taxSum, candidateMedian) }
+            return candidateMedian
+        }()
+
+        let best: Candidate = plausible.min { a, b in
             let ad = a.value > target ? a.value - target : target - a.value
             let bd = b.value > target ? b.value - target : target - b.value
             if ad != bd { return ad < bd }
@@ -1923,14 +1953,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // Override policy:
         //   * Hallucinated — FM's value doesn't exist in OCR, so it
         //     can't be right. Always replace.
-        //   * savingsBlockConfusion — items_sum is more than double
-        //     FM's total. The grand total must be ≥ items_sum, so FM
-        //     is guaranteed wrong. Always replace.
+        //   * savingsBlockConfusion — items_sum is much larger than
+        //     FM's total. FM is guaranteed wrong. Always replace.
+        //   * implausiblyLarge — FM's value is huge vs items (digit-
+        //     run misread). Always replace with something reasonable.
         //   * Otherwise — require the replacement to beat FM on
-        //     arithmetic fit. This branch isn't currently reachable
-        //     (the guardrail only fires under one of the two flags
-        //     above) but keeps the logic future-proof.
-        if !hallucinated && !savingsBlockConfusion {
+        //     arithmetic fit. Not currently reachable but future-proof.
+        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge {
             let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
             let newDiff = best.value > target ? best.value - target : target - best.value
             guard newDiff < fmDiff else { return receipt }
