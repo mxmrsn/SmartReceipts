@@ -327,6 +327,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // original observation either way.
         receipt = Self.attachBBoxes(receipt: receipt, lines: postLines)
 
+        // Replace the field-average confidence with a receipt-level score
+        // grounded in structural signals (items sum to total, date parsed,
+        // merchant identified, no metadata leakage). Downstream consumers
+        // filter or highlight low-confidence extractions.
+        receipt.provenance.confidence = Self.computeReceiptConfidence(receipt)
+
         return ExtractionResult(
             receipt: receipt,
             latencyMs: elapsedMs,
@@ -334,6 +340,130 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             rawText: rawText,
             ocrLines: lines.map { OCRLine(text: $0.text, box: $0.box) }
         )
+    }
+
+    // MARK: - Confidence scoring
+
+    /// Compute a 0.0–1.0 receipt-level confidence from structural signals.
+    ///
+    /// The dominant signal is "items sum to total (± tax/tip)": if that
+    /// holds within a small relative tolerance, the extraction is almost
+    /// certainly correct end-to-end. From there we subtract for missing /
+    /// suspicious pieces (no date, no merchant, no line items, an
+    /// implausibly large total, metadata leaked into descriptions).
+    ///
+    /// Kept intentionally simple so it's easy to reason about downstream —
+    /// dashboards can bucket by e.g. ≥ 0.85 high, ≥ 0.6 medium, < 0.6 low.
+    static func computeReceiptConfidence(_ receipt: Receipt) -> Double {
+        let total = doubleValue(receipt.totals.total)
+        let itemsSum = receipt.lineItems.reduce(0.0) { $0 + doubleValue($1.totalPrice) }
+        let tax = receipt.totals.tax.reduce(0.0) { $0 + doubleValue($1.amount) }
+        let tip = doubleValue(receipt.totals.tip ?? 0)
+        let discount = doubleValue(receipt.totals.discount ?? 0)
+
+        var score = 0.5
+
+        // Structural agreement between items sum and total. The best signal
+        // by far: if it balances, everything else was probably read right.
+        if total > 0 {
+            let expected = itemsSum + tax + tip - discount
+            let delta = abs(total - expected)
+            let rel = delta / total
+            if rel < 0.01 {
+                score += 0.40         // exact match
+            } else if rel < 0.03 {
+                score += 0.32
+            } else if rel < 0.06 {
+                score += 0.22
+            } else if rel < 0.10 {
+                score += 0.10
+            } else if rel < 0.20 {
+                score -= 0.05
+            } else if rel < 0.50 {
+                score -= 0.20
+            } else {
+                score -= 0.35
+            }
+        } else {
+            // No total at all — we have almost nothing to check against.
+            score -= 0.25
+        }
+
+        // Every line item has a plausible positive price.
+        if !receipt.lineItems.isEmpty {
+            let allPricesOK = receipt.lineItems.allSatisfy { item in
+                let v = doubleValue(item.totalPrice)
+                return v != 0 && abs(v) < max(total * 5, 1000)
+            }
+            if allPricesOK {
+                score += 0.05
+            } else {
+                score -= 0.10
+            }
+        } else {
+            // Zero line items on a non-trivial receipt is suspicious.
+            if total > 3 { score -= 0.15 }
+        }
+
+        // Date parsed.
+        let dateValue = receipt.header.date.value
+        if dateValue.count == 10, dateValue.contains("-") {
+            score += 0.05
+        } else {
+            score -= 0.10
+        }
+
+        // Merchant identified.
+        let merchant = receipt.header.merchant.name.trimmingCharacters(in: .whitespaces)
+        if !merchant.isEmpty, merchant.lowercased() != "unknown" {
+            score += 0.05
+        } else {
+            score -= 0.10
+        }
+
+        // Metadata leakage in descriptions.
+        let metadataMarkers = ["personalized", "lb @", "oz @", "sale price", "member savings"]
+        let hasMetadataLeak = receipt.lineItems.contains { item in
+            let d = item.description.lowercased()
+            return metadataMarkers.contains { d.contains($0) }
+        }
+        if hasMetadataLeak {
+            score -= 0.08
+        }
+
+        // Pure-numeric description (SKU/UPC leaked past the strip).
+        let hasSKUDesc = receipt.lineItems.contains { item in
+            let stripped = item.description.trimmingCharacters(in: .whitespaces)
+            return stripped.count >= 6 && stripped.allSatisfy(\.isNumber)
+        }
+        if hasSKUDesc { score -= 0.05 }
+
+        // Tax > 50% of total is nonsense — usually the "total" cell was
+        // misread and a subtotal / balance value ended up there.
+        if total > 0, tax > total * 0.5 { score -= 0.20 }
+
+        // Future date — we've seen the LLM sometimes pattern-match a
+        // "22/07/2027"-shaped random string as a date. Not real.
+        if dateValue > isoTodayPlusTenYears() {
+            score -= 0.15
+        }
+
+        return max(0.0, min(1.0, score))
+    }
+
+    private static func doubleValue(_ d: Decimal) -> Double {
+        NSDecimalNumber(decimal: d).doubleValue
+    }
+
+    /// Bound used to flag obviously-hallucinated dates. Not intended to be
+    /// exact — just "clearly in the far future" — so we compute it against
+    /// a fixed reference year rather than `Date()` (avoids nondeterminism
+    /// in tests / benches).
+    private static func isoTodayPlusTenYears() -> String {
+        // Any date past this string reads as "certainly hallucinated".
+        // Bumping the year here every decade is fine — we're gating
+        // against pattern-matched garbage, not enforcing a real deadline.
+        return "2036-01-01"
     }
 
     // MARK: - Instructions

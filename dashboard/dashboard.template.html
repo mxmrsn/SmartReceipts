@@ -1,0 +1,736 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Receipts — Insights</title>
+<style>
+  :root {
+    --bg:        #0b0d10;
+    --panel:     #12151a;
+    --panel-2:   #171b22;
+    --border:    #23272f;
+    --text:      #e6e8eb;
+    --text-dim:  #8a919b;
+    --text-mute: #5b616b;
+    --accent:    #7aa5ff;
+    --accent-2:  #9d7bff;
+    --ok:        #4ec9b0;
+    --warn:      #d7b45e;
+    --bad:       #d76a6a;
+    --grid:      #1a1e25;
+    --hover:     #1e232b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, system-ui, sans-serif;
+    font-feature-settings: 'tnum';
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+
+  /* Header */
+  .top {
+    padding: 28px 32px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 24px;
+    flex-wrap: wrap;
+  }
+  .top h1 {
+    margin: 0;
+    font-weight: 500;
+    font-size: 22px;
+    letter-spacing: -0.01em;
+  }
+  .top h1 .dot { color: var(--accent); }
+  .top .sub {
+    color: var(--text-dim);
+    font-size: 13px;
+    margin-top: 2px;
+  }
+
+  /* View toggle */
+  .toggle {
+    display: inline-flex;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 2px;
+  }
+  .toggle button {
+    background: transparent;
+    color: var(--text-dim);
+    border: 0;
+    padding: 7px 14px;
+    font: inherit;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background .12s ease, color .12s ease;
+  }
+  .toggle button:hover { color: var(--text); }
+  .toggle button.active {
+    background: var(--panel-2);
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+
+  /* Grid */
+  .grid {
+    padding: 24px 32px 48px;
+    display: grid;
+    grid-template-columns: repeat(12, 1fr);
+    gap: 18px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px 20px;
+    min-height: 0;
+  }
+  .panel h3 {
+    margin: 0 0 4px;
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+  .panel h3 .helper {
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-mute);
+    margin-left: 8px;
+    font-weight: 400;
+  }
+  .stat {
+    font-size: 30px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    margin-top: 6px;
+  }
+  .stat .delta {
+    font-size: 12px;
+    color: var(--text-dim);
+    font-weight: 400;
+    margin-left: 8px;
+    letter-spacing: 0;
+  }
+  .delta.up { color: var(--warn); }
+  .delta.down { color: var(--ok); }
+
+  /* Spans */
+  .c-3 { grid-column: span 3; }
+  .c-4 { grid-column: span 4; }
+  .c-6 { grid-column: span 6; }
+  .c-8 { grid-column: span 8; }
+  .c-9 { grid-column: span 9; }
+  .c-12 { grid-column: span 12; }
+
+  @media (max-width: 1100px) {
+    .c-3, .c-4 { grid-column: span 6; }
+    .c-6, .c-8, .c-9 { grid-column: span 12; }
+  }
+
+  /* Charts */
+  svg { display: block; width: 100%; }
+  svg .grid-line { stroke: var(--grid); stroke-width: 1; }
+  svg .axis-text { fill: var(--text-mute); font-size: 10px; }
+  svg .bar { fill: var(--accent); }
+  svg .bar-2 { fill: var(--accent-2); }
+  svg .line { fill: none; stroke: var(--accent); stroke-width: 2; }
+  svg .line-fill {
+    fill: url(#lineGradient);
+    opacity: 0.35;
+  }
+  svg .dot { fill: var(--accent); }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 10px 8px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+  }
+  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td {
+    padding: 9px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text);
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--hover); }
+  td.dim { color: var(--text-dim); }
+  .scrollable {
+    max-height: 380px;
+    overflow-y: auto;
+    margin: 0 -4px;
+  }
+  .scrollable::-webkit-scrollbar { width: 6px; }
+  .scrollable::-webkit-scrollbar-track { background: transparent; }
+  .scrollable::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* Confidence pill */
+  .pill {
+    display: inline-block;
+    min-width: 44px;
+    text-align: center;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.02em;
+  }
+  .pill.high { background: rgba(78, 201, 176, 0.14); color: var(--ok); }
+  .pill.med  { background: rgba(215, 180, 94, 0.14); color: var(--warn); }
+  .pill.low  { background: rgba(215, 106, 106, 0.15); color: var(--bad); }
+
+  /* Sector legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 12px 20px; margin-top: 12px; font-size: 12px; color: var(--text-dim); }
+  .legend .sw {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    margin-right: 8px;
+    vertical-align: -1px;
+  }
+  .legend .amt { color: var(--text); margin-left: 6px; font-variant-numeric: tabular-nums; }
+
+  /* Empty state */
+  .empty {
+    color: var(--text-mute);
+    font-size: 13px;
+    padding: 32px 0;
+    text-align: center;
+  }
+
+  /* Product picker */
+  select {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font: inherit;
+    max-width: 220px;
+  }
+  select:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div>
+    <h1>Smart Receipts <span class="dot">·</span> Insights</h1>
+    <div class="sub" id="subtitle">Loading…</div>
+  </div>
+  <div class="toggle" id="viewToggle">
+    <button data-view="week">Weekly</button>
+    <button data-view="month" class="active">Monthly</button>
+    <button data-view="year">Yearly</button>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel c-3">
+    <h3>Total Spend</h3>
+    <div class="stat" id="statTotal">—</div>
+    <div class="sub" id="statTotalHelper" style="color:var(--text-dim);font-size:12px;margin-top:4px;"></div>
+  </div>
+  <div class="panel c-3">
+    <h3>Receipts</h3>
+    <div class="stat" id="statCount">—</div>
+    <div class="sub" id="statCountHelper" style="color:var(--text-dim);font-size:12px;margin-top:4px;"></div>
+  </div>
+  <div class="panel c-3">
+    <h3>Avg. Basket</h3>
+    <div class="stat" id="statAvg">—</div>
+    <div class="sub" style="color:var(--text-dim);font-size:12px;margin-top:4px;">per receipt</div>
+  </div>
+  <div class="panel c-3">
+    <h3>Confidence <span class="helper">≥ 0.85 high</span></h3>
+    <div class="stat" id="statConf">—</div>
+    <div class="sub" id="statConfHelper" style="color:var(--text-dim);font-size:12px;margin-top:4px;"></div>
+  </div>
+
+  <div class="panel c-8">
+    <h3>Spending Over Time</h3>
+    <svg id="chartTrend" viewBox="0 0 800 260" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="panel c-4">
+    <h3>Spend by Sector</h3>
+    <svg id="chartSector" viewBox="0 0 300 220"></svg>
+    <div id="sectorLegend" class="legend"></div>
+  </div>
+
+  <div class="panel c-6">
+    <h3>Top Merchants <span class="helper">by spend</span></h3>
+    <div class="scrollable">
+      <table id="tableMerchants">
+        <thead><tr>
+          <th>Merchant</th>
+          <th class="num">Spend</th>
+          <th class="num">Visits</th>
+          <th class="num">Avg</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="panel c-6">
+    <h3>Recent Receipts <span class="helper">low confidence highlighted</span></h3>
+    <div class="scrollable">
+      <table id="tableRecent">
+        <thead><tr>
+          <th>Date</th>
+          <th>Merchant</th>
+          <th class="num">Total</th>
+          <th class="num">Conf</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel c-12">
+    <h3>Repeat Product <span class="helper">price over time</span>
+      <select id="productPicker" style="margin-left:14px"></select>
+    </h3>
+    <svg id="chartProduct" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
+    <div id="productMeta" style="color:var(--text-dim);font-size:12px;margin-top:8px;"></div>
+  </div>
+</div>
+
+<script>
+const RAW_DATA = __DATA__;
+
+// ----- Utilities -----
+const fmtMoney = n => `$${n.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+const fmtInt = n => n.toLocaleString('en-US');
+const parseDate = s => new Date(s + 'T00:00:00');
+
+// Bucket a date into a period key based on view.
+function bucketKey(dateStr, view) {
+  const d = parseDate(dateStr);
+  if (view === 'year') return String(d.getFullYear());
+  if (view === 'month') {
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0');
+  }
+  // Weekly: ISO week starting Monday.
+  const day = d.getDay() || 7; // Mon=1..Sun=7
+  d.setDate(d.getDate() - day + 1);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function bucketLabel(key, view) {
+  if (view === 'year') return key;
+  if (view === 'month') {
+    const [y, m] = key.split('-');
+    return new Date(y, parseInt(m) - 1, 1).toLocaleString('en-US', {month: 'short', year: '2-digit'});
+  }
+  const d = new Date(key);
+  return d.toLocaleString('en-US', {month: 'short', day: 'numeric'});
+}
+
+function confidenceBand(c) {
+  if (c >= 0.85) return 'high';
+  if (c >= 0.60) return 'med';
+  return 'low';
+}
+
+// ----- Sector palette (deterministic) -----
+const SECTOR_ORDER = ['Groceries', 'Restaurants', 'Coffee', 'Big Box', 'Home & Hardware', 'Fuel', 'Pet', 'Services', 'Other'];
+const SECTOR_COLORS = {
+  'Groceries':        '#7aa5ff',
+  'Restaurants':      '#9d7bff',
+  'Coffee':           '#e6a37a',
+  'Big Box':          '#4ec9b0',
+  'Home & Hardware':  '#d7b45e',
+  'Fuel':             '#d76a6a',
+  'Pet':              '#7ac8d7',
+  'Services':         '#c07ad7',
+  'Other':            '#5b616b',
+};
+
+// ----- State -----
+let currentView = 'month';
+const data = RAW_DATA;
+
+// Global stats.
+function updateStats() {
+  const total = data.reduce((s, r) => s + r.total, 0);
+  const count = data.length;
+  const avg = count ? total / count : 0;
+  const conf = count ? data.reduce((s, r) => s + r.confidence, 0) / count : 0;
+  const hi = data.filter(r => r.confidence >= 0.85).length;
+
+  document.getElementById('statTotal').textContent = fmtMoney(total);
+  document.getElementById('statCount').textContent = fmtInt(count);
+  document.getElementById('statAvg').textContent = fmtMoney(avg);
+  document.getElementById('statConf').innerHTML = `${(conf * 100).toFixed(0)}<span class="delta">/100</span>`;
+  document.getElementById('statConfHelper').textContent = `${hi} of ${count} at ≥ 0.85`;
+
+  const dates = data.map(r => r.date).filter(Boolean).sort();
+  if (dates.length) {
+    document.getElementById('statTotalHelper').textContent = `${dates[0]} → ${dates[dates.length - 1]}`;
+    document.getElementById('statCountHelper').textContent = `${new Set(data.map(r => r.merchant)).size} unique merchants`;
+  }
+
+  document.getElementById('subtitle').textContent =
+    `${count} receipts extracted · ${new Set(data.map(r => r.merchant)).size} merchants · avg confidence ${(conf * 100).toFixed(0)}%`;
+}
+
+// Spending trend chart.
+function renderTrend() {
+  const svg = document.getElementById('chartTrend');
+  svg.innerHTML = '';
+  if (!data.length) {
+    svg.insertAdjacentHTML('beforeend', '<text x="400" y="130" text-anchor="middle" class="axis-text">No data yet</text>');
+    return;
+  }
+
+  const buckets = new Map();
+  for (const r of data) {
+    if (!r.date) continue;
+    const k = bucketKey(r.date, currentView);
+    buckets.set(k, (buckets.get(k) || 0) + r.total);
+  }
+  const keys = [...buckets.keys()].sort();
+  const vals = keys.map(k => buckets.get(k));
+  if (!vals.length) return;
+  const maxV = Math.max(...vals) * 1.1 || 1;
+
+  const W = 800, H = 260;
+  const padL = 40, padR = 10, padT = 12, padB = 24;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+  const step = keys.length > 1 ? innerW / (keys.length - 1) : 0;
+
+  // Gradient defs.
+  svg.insertAdjacentHTML('beforeend', `
+    <defs><linearGradient id="lineGradient" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#7aa5ff" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#7aa5ff" stop-opacity="0"/>
+    </linearGradient></defs>`);
+
+  // Horizontal gridlines + Y labels.
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const y = padT + (innerH * i) / yTicks;
+    const v = maxV - (maxV * i) / yTicks;
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="grid-line" x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}"/>` +
+      `<text class="axis-text" x="${padL - 6}" y="${y + 3}" text-anchor="end">$${v.toFixed(0)}</text>`
+    );
+  }
+
+  // Path (area + line).
+  const points = keys.map((k, i) => {
+    const x = padL + i * step;
+    const y = padT + innerH * (1 - vals[i] / maxV);
+    return [x, y];
+  });
+  const linePath = 'M ' + points.map(p => p.join(',')).join(' L ');
+  const areaPath = linePath + ` L ${padL + (keys.length - 1) * step},${padT + innerH} L ${padL},${padT + innerH} Z`;
+  svg.insertAdjacentHTML('beforeend', `<path class="line-fill" d="${areaPath}"/>`);
+  svg.insertAdjacentHTML('beforeend', `<path class="line" d="${linePath}"/>`);
+
+  // Dots + hover.
+  for (let i = 0; i < points.length; i++) {
+    const [x, y] = points[i];
+    svg.insertAdjacentHTML('beforeend', `<circle class="dot" cx="${x}" cy="${y}" r="3">
+      <title>${bucketLabel(keys[i], currentView)}: ${fmtMoney(vals[i])}</title>
+    </circle>`);
+  }
+
+  // X labels: show ~6 evenly spread.
+  const step2 = Math.max(1, Math.floor(keys.length / 6));
+  for (let i = 0; i < keys.length; i += step2) {
+    const x = padL + i * step;
+    svg.insertAdjacentHTML('beforeend',
+      `<text class="axis-text" x="${x}" y="${H - 6}" text-anchor="middle">${bucketLabel(keys[i], currentView)}</text>`
+    );
+  }
+}
+
+// Sector donut chart.
+function renderSector() {
+  const svg = document.getElementById('chartSector');
+  const legend = document.getElementById('sectorLegend');
+  svg.innerHTML = '';
+  legend.innerHTML = '';
+
+  const totals = new Map();
+  for (const r of data) {
+    totals.set(r.sector, (totals.get(r.sector) || 0) + r.total);
+  }
+  const items = SECTOR_ORDER
+    .map(s => ({sector: s, total: totals.get(s) || 0}))
+    .filter(x => x.total > 0);
+  const sum = items.reduce((s, x) => s + x.total, 0) || 1;
+
+  const cx = 150, cy = 100, r = 78, rInner = 48;
+  let angle = -Math.PI / 2;
+
+  for (const it of items) {
+    const frac = it.total / sum;
+    const sweep = frac * Math.PI * 2;
+    const large = sweep > Math.PI ? 1 : 0;
+    const x1 = cx + r * Math.cos(angle);
+    const y1 = cy + r * Math.sin(angle);
+    const x2 = cx + r * Math.cos(angle + sweep);
+    const y2 = cy + r * Math.sin(angle + sweep);
+    const ix1 = cx + rInner * Math.cos(angle + sweep);
+    const iy1 = cy + rInner * Math.sin(angle + sweep);
+    const ix2 = cx + rInner * Math.cos(angle);
+    const iy2 = cy + rInner * Math.sin(angle);
+    const d = `M ${x1},${y1} A ${r},${r} 0 ${large} 1 ${x2},${y2} L ${ix1},${iy1} A ${rInner},${rInner} 0 ${large} 0 ${ix2},${iy2} Z`;
+    svg.insertAdjacentHTML('beforeend',
+      `<path d="${d}" fill="${SECTOR_COLORS[it.sector] || '#5b616b'}" opacity="0.9">
+        <title>${it.sector}: ${fmtMoney(it.total)} (${(frac * 100).toFixed(1)}%)</title>
+      </path>`);
+    angle += sweep;
+  }
+
+  svg.insertAdjacentHTML('beforeend',
+    `<text x="${cx}" y="${cy - 4}" text-anchor="middle" fill="var(--text)" style="font-size:20px;font-weight:500">${fmtMoney(sum).replace('.00', '')}</text>` +
+    `<text x="${cx}" y="${cy + 14}" text-anchor="middle" class="axis-text">total</text>`
+  );
+
+  for (const it of items) {
+    legend.insertAdjacentHTML('beforeend',
+      `<div><span class="sw" style="background:${SECTOR_COLORS[it.sector]}"></span>${it.sector}<span class="amt">${fmtMoney(it.total)}</span></div>`
+    );
+  }
+}
+
+// Merchant table.
+function renderMerchants() {
+  const tbody = document.querySelector('#tableMerchants tbody');
+  tbody.innerHTML = '';
+  const byMerchant = new Map();
+  for (const r of data) {
+    const m = byMerchant.get(r.merchant) || {spend: 0, visits: 0};
+    m.spend += r.total;
+    m.visits += 1;
+    byMerchant.set(r.merchant, m);
+  }
+  const rows = [...byMerchant.entries()]
+    .map(([name, x]) => ({name, ...x, avg: x.spend / x.visits}))
+    .sort((a, b) => b.spend - a.spend)
+    .slice(0, 40);
+
+  for (const row of rows) {
+    tbody.insertAdjacentHTML('beforeend', `<tr>
+      <td>${row.name}</td>
+      <td class="num">${fmtMoney(row.spend)}</td>
+      <td class="num dim">${fmtInt(row.visits)}</td>
+      <td class="num dim">${fmtMoney(row.avg)}</td>
+    </tr>`);
+  }
+  if (!rows.length) tbody.innerHTML = '<tr><td colspan="4" class="empty">No merchants yet.</td></tr>';
+}
+
+// Recent receipts table.
+function renderRecent() {
+  const tbody = document.querySelector('#tableRecent tbody');
+  tbody.innerHTML = '';
+  const sorted = [...data].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 40);
+  for (const r of sorted) {
+    const band = confidenceBand(r.confidence);
+    tbody.insertAdjacentHTML('beforeend', `<tr>
+      <td class="dim">${r.date}</td>
+      <td>${r.merchant}</td>
+      <td class="num">${fmtMoney(r.total)}</td>
+      <td class="num"><span class="pill ${band}">${(r.confidence * 100).toFixed(0)}</span></td>
+    </tr>`);
+  }
+  if (!sorted.length) tbody.innerHTML = '<tr><td colspan="4" class="empty">No receipts yet.</td></tr>';
+}
+
+// ----- Repeat product -----
+// Find products (item descriptions) that appear in ≥2 receipts and are
+// substantive purchases (not CRV deposits, not bottle-refund lines).
+// Show a price-over-time chart for the selected one.
+const NOISE_PATTERNS = [
+  /^crv/,           // CA container-refund deposit
+  /^\*crv/,
+  /^bag fee/,
+  /^bag/,
+  /discount/,
+  /^tax/,
+  /savings/,
+  /coupon/,
+  /^additional/,
+  /^\*+$/,
+];
+
+function buildProductIndex() {
+  const idx = new Map(); // desc → [{date, price, merchant, receipt}]
+  for (const r of data) {
+    for (const it of r.items) {
+      const key = normalizeDesc(it.desc);
+      if (!key) continue;
+      if (Math.abs(it.price) < 0.75) continue;   // skip tiny bottle fees
+      if (NOISE_PATTERNS.some(rx => rx.test(key))) continue;
+      if (!idx.has(key)) idx.set(key, []);
+      idx.get(key).push({
+        date: r.date,
+        price: it.price,
+        merchant: r.merchant,
+        receipt: r.file,
+      });
+    }
+  }
+  // Rank by (visit count, then total spend) so genuinely repeat items win.
+  const repeats = [...idx.entries()]
+    .filter(([_, xs]) => xs.length >= 2)
+    .map(([k, xs]) => [k, xs, xs.reduce((s, x) => s + x.price, 0)])
+    .sort((a, b) => b[1].length - a[1].length || b[2] - a[2])
+    .map(([k, xs]) => [k, xs]);
+  return repeats;
+}
+
+function normalizeDesc(desc) {
+  return (desc || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function renderProductPicker() {
+  const sel = document.getElementById('productPicker');
+  const repeats = buildProductIndex();
+  sel.innerHTML = '';
+  if (!repeats.length) {
+    sel.insertAdjacentHTML('beforeend', '<option>No repeat products yet</option>');
+    return;
+  }
+  for (const [key, entries] of repeats.slice(0, 100)) {
+    const label = titleCase(key).slice(0, 50);
+    sel.insertAdjacentHTML('beforeend',
+      `<option value="${escape(key)}">${label} · ${entries.length}×</option>`
+    );
+  }
+  sel.onchange = () => renderProduct(sel.value, repeats);
+  renderProduct(sel.value, repeats);
+}
+
+function titleCase(s) {
+  return s.replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function escape(s) {
+  return s.replace(/"/g, '&quot;');
+}
+
+function renderProduct(key, repeats) {
+  const svg = document.getElementById('chartProduct');
+  const meta = document.getElementById('productMeta');
+  svg.innerHTML = '';
+  meta.textContent = '';
+
+  const entry = repeats.find(([k, _]) => k === key);
+  if (!entry) return;
+
+  const [_, points] = entry;
+  const sorted = points.slice().sort((a, b) => a.date.localeCompare(b.date));
+
+  const W = 800, H = 220;
+  const padL = 44, padR = 10, padT = 12, padB = 24;
+  const innerW = W - padL - padR;
+  const innerH = H - padT - padB;
+
+  const prices = sorted.map(x => x.price);
+  const minP = Math.max(0, Math.min(...prices) * 0.9);
+  const maxP = Math.max(...prices) * 1.1 || 1;
+
+  const dates = sorted.map(x => parseDate(x.date).getTime());
+  const dmin = Math.min(...dates);
+  const dmax = Math.max(...dates);
+  const drange = Math.max(1, dmax - dmin);
+
+  // Gridlines.
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const y = padT + (innerH * i) / yTicks;
+    const v = maxP - (maxP - minP) * (i / yTicks);
+    svg.insertAdjacentHTML('beforeend',
+      `<line class="grid-line" x1="${padL}" x2="${W - padR}" y1="${y}" y2="${y}"/>` +
+      `<text class="axis-text" x="${padL - 6}" y="${y + 3}" text-anchor="end">$${v.toFixed(2)}</text>`
+    );
+  }
+
+  const points2 = sorted.map(p => {
+    const x = padL + innerW * ((parseDate(p.date).getTime() - dmin) / drange);
+    const y = padT + innerH * (1 - (p.price - minP) / (maxP - minP || 1));
+    return {x, y, p};
+  });
+
+  if (points2.length > 1) {
+    const linePath = 'M ' + points2.map(pt => `${pt.x},${pt.y}`).join(' L ');
+    svg.insertAdjacentHTML('beforeend', `<path class="line" d="${linePath}"/>`);
+  }
+  for (const pt of points2) {
+    svg.insertAdjacentHTML('beforeend',
+      `<circle class="dot" cx="${pt.x}" cy="${pt.y}" r="4">
+        <title>${pt.p.date} · ${pt.p.merchant} · ${fmtMoney(pt.p.price)}</title>
+      </circle>`);
+  }
+
+  // X labels.
+  svg.insertAdjacentHTML('beforeend',
+    `<text class="axis-text" x="${padL}" y="${H - 6}">${sorted[0].date}</text>` +
+    `<text class="axis-text" x="${W - padR}" y="${H - 6}" text-anchor="end">${sorted[sorted.length - 1].date}</text>`
+  );
+
+  const avg = prices.reduce((s, p) => s + p, 0) / prices.length;
+  const merchants = new Set(sorted.map(x => x.merchant));
+  meta.textContent = `${sorted.length} purchases · avg ${fmtMoney(avg)} · ${merchants.size} merchant(s) · range ${fmtMoney(Math.min(...prices))} – ${fmtMoney(Math.max(...prices))}`;
+}
+
+// ----- View toggle wiring -----
+document.querySelectorAll('#viewToggle button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('#viewToggle button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentView = btn.dataset.view;
+    renderTrend();
+  });
+});
+
+// ----- Boot -----
+function render() {
+  updateStats();
+  renderTrend();
+  renderSector();
+  renderMerchants();
+  renderRecent();
+  renderProductPicker();
+}
+render();
+</script>
+</body>
+</html>
