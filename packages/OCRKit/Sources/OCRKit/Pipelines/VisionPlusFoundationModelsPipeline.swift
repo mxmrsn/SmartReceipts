@@ -416,6 +416,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // original observation either way.
         receipt = Self.attachBBoxes(receipt: receipt, lines: postLines)
 
+        // Late arithmetic pass, AFTER all item filtering has settled:
+        // when the items independently sum to the printed total, any
+        // nonzero tax / tip / discount is arithmetically impossible —
+        // those fields are phantom copies (a "You Saved" amount or rate
+        // value FM cross-wired into them). This must run after the item
+        // list is final, unlike reconcileTotalsArithmetic which runs
+        // before the weight/non-item passes mutate items.
+        receipt = Self.reconcileItemsVsTotals(receipt)
         // Replace the field-average confidence with a receipt-level score
         // grounded in structural signals (items sum to total, date parsed,
         // merchant identified, no metadata leakage). Downstream consumers
@@ -562,6 +570,52 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
         }
         return nil
+    }
+
+    /// See call site: clears phantom tax / tip / discount when the final
+    /// item list already sums to the total, and clamps tax down to the
+    /// arithmetic gap when items nearly reach the total on their own.
+    private static func reconcileItemsVsTotals(_ input: Receipt) -> Receipt {
+        var receipt = input
+        let total = receipt.totals.total
+        guard total > 0, !receipt.lineItems.isEmpty else { return receipt }
+        let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
+        guard itemsSum > 0 else { return receipt }
+
+        let tol: Decimal = max(Decimal(0.02), total * Decimal(0.005))
+        let gap = total - itemsSum
+        let absGap = gap < 0 ? -gap : gap
+
+        let tax = receipt.totals.tax.first?.amount ?? 0
+        let tip = receipt.totals.tip ?? 0
+        let discount = receipt.totals.discount ?? 0
+        let extras = tax + tip - discount
+        let absExtras = extras < 0 ? -extras : extras
+
+        // Items ≈ total exactly: nothing else fits. Two independently-
+        // extracted signals agreeing beats any single extracted field.
+        // (IMG_2678: sum == total == 32.42 yet tax AND tip both said
+        // 6.43 — a savings amount cross-wired into both slots.)
+        if absGap <= tol, absExtras > tol {
+            receipt.totals.tax = []
+            receipt.totals.tip = nil
+            receipt.totals.discount = nil
+            if let s = receipt.totals.subtotal, s != total {
+                receipt.totals.subtotal = nil
+            }
+            return receipt
+        }
+
+        // Items nearly reach the total (≥ 90%): the tax can never
+        // exceed the remaining gap. A bigger extracted value is a
+        // misread — clamp it to the arithmetic remainder. Only when
+        // tip/discount are absent so the algebra is unambiguous.
+        if gap > tol, itemsSum >= total * Decimal(0.9),
+           tip == 0, discount == 0, tax > gap + tol {
+            receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: nil, amount: gap)]
+            receipt.provenance.fieldConfidence["totals.tax"] = 0.6
+        }
+        return receipt
     }
 
     // MARK: - Confidence scoring
@@ -1922,6 +1976,22 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 // real product name vs a brand prefix.
                 return a.text.count > b.text.count
             }
+            // If the closest-row candidate is a money-summary label
+            // ("Total Bottle Deposit", "TAX", "Balance …"), the price
+            // BELONGS to that label — skip the price point entirely
+            // rather than letting the nearest item description above
+            // claim it. TJ IMG_7496 extracted a third "BEANS GREEN
+            // $0.10" because the deposit-summary's $0.10 fell through
+            // to the beans row when the label was filtered out.
+            if let closest = candidates.first {
+                let closestBucket = (closest.dy / 0.005).rounded(.down)
+                let owned = candidates.contains { c in
+                    (c.dy / 0.005).rounded(.down) == closestBucket
+                        && Self.labelOwnsPrice(c.text)
+                }
+                if owned { continue }
+            }
+
             // Walk sorted candidates and take the FIRST one that
             // survives the non-item filters. If the closest-Y candidate
             // is a SKU / weight-marker / metadata fragment (which the
@@ -1965,6 +2035,23 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
 
         return items
+    }
+
+    /// True when a text observation is a money-summary label that owns
+    /// the price printed next to it ("Total Bottle Deposit", "TAX",
+    /// "Balance to pay"). Used by column-anchored extraction to skip
+    /// prices whose closest-row text is such a label — attributing them
+    /// to the nearest ITEM description above would invent a line item.
+    private static func labelOwnsPrice(_ text: String) -> Bool {
+        let n = text.lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9 ]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #" +"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        let prefixes = [
+            "total", "subtotal", "sub total", "balance",
+            "tax", "change", "payment", "amount due", "amount paid",
+        ]
+        return prefixes.contains { n == $0 || n.hasPrefix($0 + " ") }
     }
 
     /// Three guards keep this conservative:
@@ -2788,7 +2875,24 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             return candidateMedian
         }()
 
-        let best: Candidate = plausible.min { a, b in
+        // A real grand total prints 2-3 times (BALANCE, PAYMENT AMOUNT,
+        // footer copy). When any candidate value appears at ≥ 2 distinct
+        // Y positions, restrict the pool to the most-repeated values —
+        // repetition is stronger evidence than distance-to-target,
+        // because the arithmetic target itself is unreliable exactly
+        // when items were badly under-extracted (TJ IMG_4623: 4 of 18
+        // items extracted, target $10.81, real total $63.37 printed
+        // twice).
+        var freqYs: [Decimal: Set<Int>] = [:]
+        for c in plausible {
+            freqYs[c.value, default: []].insert(Int((c.y * 1000).rounded()))
+        }
+        let maxFreq = plausible.map { freqYs[$0.value]?.count ?? 1 }.max() ?? 1
+        let pool = maxFreq >= 2
+            ? plausible.filter { (freqYs[$0.value]?.count ?? 1) == maxFreq }
+            : plausible
+
+        let best: Candidate = pool.min { a, b in
             let ad = a.value > target ? a.value - target : target - a.value
             let bd = b.value > target ? b.value - target : target - b.value
             if ad != bd { return ad < bd }
@@ -3159,6 +3263,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // Safeway-specific column markers — appear in the price
             // column area at random Ys and confuse recovery.
             "vol", "vol+", "vol-", "wt", "info",
+            // Unit markers — Ace/Hassett print "$31.99 EA *" (unit
+            // price row) above the extended total; the orphaned "EA"
+            // observation claims the unit price as its own line item,
+            // doubling the product (IMG_5255: 1 CO2 refill became 2).
+            "ea", "each", "ea *",
         ]
         if metadataFragments.contains(lc) || metadataFragments.contains(stripped) { return true }
 
@@ -3458,34 +3567,49 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// gets treated as $79, blowing up items_sum on Safeway receipts.
     ///
     /// Merge conditions:
-    ///   * LEFT observation matches `\d{1,3}\.` (digit(s) + dot only,
-    ///     nothing after the dot).
-    ///   * RIGHT observation matches `\d{1,3}(\s+[A-Z])?` (digits with
-    ///     optional tax marker suffix — no dot).
+    ///   * LEFT observation is a bare dollars fragment: optional "$",
+    ///     1-3 digits, OPTIONAL trailing "." or "," ("2.", "$2.", "$8").
+    ///   * RIGHT observation is a bare cents fragment: OPTIONAL leading
+    ///     "." or ",", exactly 2 digits, optional single-letter tax
+    ///     marker (". 29", "49", "79 S").
+    ///   * SEPARATOR EVIDENCE: at least one side carries the decimal
+    ///     separator (left trailing dot OR right leading dot). Without
+    ///     it, "2" + "49" is more likely a quantity next to an
+    ///     unrelated number than a split $2.49 — don't guess.
     ///   * Same Y within 0.005.
     ///   * X gap between LEFT.rightEdge and RIGHT.leftEdge ≤ 0.02.
     /// When matched, the LEFT observation's text becomes the merged
-    /// price (e.g. "2.79 S") and the RIGHT observation is dropped.
-    /// LEFT's bounding box is extended to cover the RIGHT observation
-    /// so bbox display and column-X detection still work.
+    /// price (e.g. "$2.29", "2.79 S") and the RIGHT observation is
+    /// dropped. LEFT's bounding box is extended to cover the RIGHT
+    /// observation so bbox display and column-X detection still work.
+    /// (Trader Joe's splits "$2.29" into "$2." and ". 29" routinely;
+    /// Safeway splits "2.79 S" into "2." and "79 S".)
     fileprivate static func mergeSplitPriceFragments(
         _ lines: [(text: String, box: Receipt.BBox)]
     ) -> [(text: String, box: Receipt.BBox)] {
         guard let leftRe = try? NSRegularExpression(
-            pattern: #"^\s*(\d{1,3})\.\s*$"#, options: []
+            pattern: #"^\s*(\$?)(\d{1,3})([.,]?)\s*$"#, options: []
         ), let rightRe = try? NSRegularExpression(
-            pattern: #"^\s*(\d{1,3})(\s+[A-Z])?\s*$"#, options: []
+            pattern: #"^\s*([.,]?)\s*(\d{2})(\s*[A-Za-z])?\s*$"#, options: []
         ) else { return lines }
+
+        func group(_ m: NSTextCheckingResult, _ i: Int, in text: String) -> String {
+            guard m.range(at: i).location != NSNotFound,
+                  let r = Range(m.range(at: i), in: text) else { return "" }
+            return String(text[r])
+        }
 
         var out = lines
         var claimed: Set<Int> = []
         for i in 0..<out.count {
+            if claimed.contains(i) { continue }
             let l = out[i]
             let lRange = NSRange(l.text.startIndex..<l.text.endIndex, in: l.text)
-            guard let lm = leftRe.firstMatch(in: l.text, options: [], range: lRange),
-                  let lDigits = Range(lm.range(at: 1), in: l.text)
-            else { continue }
-            let leftValue = String(l.text[lDigits])
+            guard let lm = leftRe.firstMatch(in: l.text, options: [], range: lRange) else { continue }
+            let dollar = group(lm, 1, in: l.text)
+            let leftValue = group(lm, 2, in: l.text)
+            let leftSep = group(lm, 3, in: l.text)
+            guard !leftValue.isEmpty else { continue }
             let leftCy = l.box.y + l.box.height / 2
             let leftXEnd = l.box.x + l.box.width
 
@@ -3497,22 +3621,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 let gap = r.box.x - leftXEnd
                 guard gap <= 0.02 else { continue }
                 let rRange = NSRange(r.text.startIndex..<r.text.endIndex, in: r.text)
-                guard let rm = rightRe.firstMatch(in: r.text, options: [], range: rRange),
-                      let rDigits = Range(rm.range(at: 1), in: r.text)
-                else { continue }
-                // Require exactly 2 digits on the right for a
-                // legitimate cents fragment — "79" merges with "2.",
-                // but "2" alone wouldn't (that'd be pennies).
-                let digits = String(r.text[rDigits])
+                guard let rm = rightRe.firstMatch(in: r.text, options: [], range: rRange) else { continue }
+                let rightSep = group(rm, 1, in: r.text)
+                let digits = group(rm, 2, in: r.text)
                 guard digits.count == 2 else { continue }
-                // Suffix (tax marker) if present.
-                var suffix = ""
-                if rm.range(at: 2).location != NSNotFound,
-                   let sufRange = Range(rm.range(at: 2), in: r.text) {
-                    suffix = String(r.text[sufRange])
-                }
+                // Separator evidence on at least one side.
+                guard !leftSep.isEmpty || !rightSep.isEmpty else { continue }
+                let suffix = group(rm, 3, in: r.text)
                 // Merge into LEFT.
-                let mergedText = "\(leftValue).\(digits)\(suffix)"
+                let mergedText = "\(dollar)\(leftValue).\(digits)\(suffix)"
                 let mergedBox = Receipt.BBox(
                     x: l.box.x,
                     y: min(l.box.y, r.box.y),
