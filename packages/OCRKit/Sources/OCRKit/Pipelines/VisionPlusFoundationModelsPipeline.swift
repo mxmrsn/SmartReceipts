@@ -263,11 +263,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // Final non-item filter: drop any line items whose description is
         // clearly a department header ("LIQUOR"), a rewards/coupon line
         // ("BASKET Grocery Rewards"), or a savings amount ("3.50-").
-        // Catches both FM-emitted and recovered items in one pass; FM
-        // sometimes treats these as items even when the row text makes
-        // it obvious they aren't.
+        // Catches both FM-emitted and recovered items in one pass.
+        //
+        // Exception: negative-priced items are allowed to keep their
+        // "Member Savings" / "Regular Price" / other-metadata
+        // descriptions. Those are the LEGITIMATE descriptions for
+        // discount / credit rows — filtering them out would silently
+        // drop legit negative line items (Safeway IMG_2460 has many
+        // "1.00- Member Savings"-style rows we want to preserve as
+        // negative-value items so items_sum reconciles with total).
         receipt.lineItems.removeAll { item in
-            Self.looksLikeNonItemRecoveryCandidate(item.description)
+            if item.totalPrice < 0 { return false }
+            return Self.looksLikeNonItemRecoveryCandidate(item.description)
         }
         // Implausible-price filter: drop items whose price exceeds
         // 3× the receipt total. On Ace Hardware IMG_4359, FM emitted
@@ -1241,7 +1248,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         totalsValues: Set<Decimal>,
         receiptTotal: Decimal
     ) -> [Receipt.LineItem] {
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        // Require decimal cents in column-anchored price detection.
+        // Integer-only prices like "79 S" are almost always OCR
+        // fragments of a longer price ("2.79 S" split by Vision into
+        // "2." and "79 S") rather than legitimate whole-dollar
+        // amounts. Allowing them lets the fragment pass as a large
+        // price and inflates items_sum (IMG_2460 Safeway "$79 ADOBO"
+        // is really $2.79). Real whole-dollar amounts are rare
+        // enough that this trade-off pays off across the sample.
+        let priceShape = #"^-?\$?-?\d{1,5}[.,]\d{1,2}(?:\s+[A-Z])?$"#
 
         // Step 1: every price-shaped observation with its value.
         // Also flag whether the observation carried a tax-category
@@ -1464,12 +1479,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // the next candidate. That's what saves Ulta receipts
             // where the SKU sits closer to the price than the actual
             // product name.
+            // For NEGATIVE-value prices, allow "Member Savings" /
+            // "Regular Price"-style descriptions to pass the non-item
+            // filter: those are legitimate labels for discount and
+            // credit line items.
+            let allowMetadataDesc = p.value < 0
             var cleaned: String? = nil
             for c in candidates {
                 let candidate = Self.cleanLineItemDescription(c.text)
                 if candidate.count < 3 { continue }
                 if Self.isFooterRow(candidate) { continue }
-                if Self.looksLikeNonItemRecoveryCandidate(candidate) { continue }
+                if !allowMetadataDesc, Self.looksLikeNonItemRecoveryCandidate(candidate) { continue }
                 cleaned = candidate
                 break
             }
@@ -2816,6 +2836,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // closing the gap, the row is no longer price-shaped and the
         // item silently disappears from extraction.
         let spaceAfterDotPattern = #"(\d)\.\s+(\d{2})\b"#
+        // (3) Trailing-minus notation ("1.00-" → "-1.00"). Safeway
+        // prints Member Savings / discount amounts with the minus AFTER
+        // the digits; without rewrite these fail priceShape and never
+        // reach column extraction as valid negative-priced line items.
+        // Only rewrite when the trailing-minus is on its own (nothing
+        // after it) to avoid corrupting "1.00-BASED" or similar
+        // product descriptions.
+        let trailingMinusPattern = #"^\s*(\d+(?:[.,]\d{1,2})?)-\s*$"#
         // (3) "$" misread as "8" or "5" — the S-with-vertical-bar shape
         // of a dollar sign often OCRs as one of those digits.
         // Detected specifically as the paired SALE/REG pattern Ace
@@ -2839,6 +2867,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(
                     of: spaceAfterDotPattern,
                     with: "$1.$2",
+                    options: .regularExpression
+                )
+                .replacingOccurrences(
+                    of: trailingMinusPattern,
+                    with: "-$1",
                     options: .regularExpression
                 )
             if let paired58 {
