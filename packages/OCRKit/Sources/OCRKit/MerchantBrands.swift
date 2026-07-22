@@ -177,12 +177,44 @@ public enum MerchantBrands {
         // First alias to hit wins. Order in `aliases` matters: longer/more
         // specific aliases come earlier so e.g. "trader joe's" wins over
         // "trader" if both were in the table.
+        //
+        // We require needles to be surrounded by non-letter characters so
+        // short aliases don't hit substrings of unrelated words: "mobil"
+        // must not match "Mobile App", "ross" must not match "cross".
         for (needle, canonical) in aliases {
-            if header.range(of: needle) != nil {
+            if occursAsWord(needle, in: header) {
                 return canonical
             }
         }
         return nil
+    }
+
+    /// True if `needle` appears in `haystack` bounded on both sides by
+    /// non-letter characters (or string edges). Both strings must already
+    /// be lowercased. Apostrophes inside the needle count as internal
+    /// characters (so "wendy's" matches "wendy's cafe").
+    private static func occursAsWord(_ needle: String, in haystack: String) -> Bool {
+        guard !needle.isEmpty else { return false }
+        var searchStart = haystack.startIndex
+        while let match = haystack.range(of: needle, range: searchStart..<haystack.endIndex) {
+            let beforeOK: Bool
+            if match.lowerBound == haystack.startIndex {
+                beforeOK = true
+            } else {
+                let prev = haystack[haystack.index(before: match.lowerBound)]
+                beforeOK = !prev.isLetter
+            }
+            let afterOK: Bool
+            if match.upperBound == haystack.endIndex {
+                afterOK = true
+            } else {
+                let next = haystack[match.upperBound]
+                afterOK = !next.isLetter
+            }
+            if beforeOK && afterOK { return true }
+            searchStart = haystack.index(after: match.lowerBound)
+        }
+        return false
     }
 
     /// True if `merchant` looks like a bare city name and probably isn't

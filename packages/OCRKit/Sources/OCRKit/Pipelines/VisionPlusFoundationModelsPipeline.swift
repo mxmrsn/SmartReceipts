@@ -38,13 +38,24 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     public func extract(image: CGImage, orientation: CGImagePropertyOrientation) async throws -> ExtractionResult {
         let startNs = DispatchTime.now().uptimeNanoseconds
 
+        // ---- 0) Preprocess: crop + dewarp the receipt out of the photo ----
+        // Receipts often occupy only a small strip of the frame (rotated on
+        // a table, curled, angled). Isolating the receipt via document
+        // segmentation and perspective-correcting into a rectangle gives
+        // Vision much cleaner input — small numeric prices that were being
+        // dropped from tilted / small-receipt photos are now recognized.
+        // If no document is detected, `preprocess` returns the original
+        // image + an identity bbox mapper, so the pipeline degrades
+        // gracefully to the pre-preprocess behavior.
+        let prep = ReceiptImagePreprocessor.preprocess(image: image, orientation: orientation)
+
         // ---- 1) Vision OCR ----
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en-US"]
 
-        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
+        let handler = VNImageRequestHandler(cgImage: prep.image, orientation: prep.orientation, options: [:])
         do {
             try handler.perform([request])
         } catch {
@@ -57,6 +68,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 guard let top = obs.topCandidates(1).first else { return nil }
                 return (text: top.string, box: Self.bbox(from: obs.boundingBox))
             }
+        // NOTE: bboxes returned in `rawLines` are in the CORRECTED image's
+        // coord space (not the original photo's). This is deliberate — the
+        // rest of the pipeline (column-anchored price extraction, row
+        // clustering, etc.) needs prices to be aligned in a vertical
+        // column, which is what the corrected image guarantees. The
+        // `prep.mapBBoxToOriginal` mapper is available for callers that
+        // need to draw bboxes on the ORIGINAL image; the labeler will
+        // eventually consume it.
+        _ = prep.mapBBoxToOriginal
         // Correct for a receipt captured 90° rotated (missing / wrong
         // EXIF, or a screenshot of a landscape phone photo). Vision
         // recognizes the characters fine either way, but the bounding
