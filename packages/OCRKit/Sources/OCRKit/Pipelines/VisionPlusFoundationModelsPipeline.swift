@@ -336,6 +336,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // OCR is clear about which label goes with which value, we
         // should trust that over FM.
         receipt = Self.sanityCheckSubtotalTaxTip(receipt: receipt, lines: postLines)
+        // Last line of defense for subtotal / tax: enforce arithmetic
+        // invariants that no real receipt can violate (tax == total,
+        // fractional-cent money, tax rates parked in money fields,
+        // subtotal == tax). Label matching can't fix these — the OCR
+        // label either wasn't found or pointed at the same junk — but
+        // arithmetic against the (already sanity-checked) total can.
+        receipt = Self.reconcileTotalsArithmetic(receipt: receipt, lines: postLines)
         // Sprouts (and other weight-priced grocery) receipts print
         // weight-based line items as a stack of THREE observations:
         //   BROCCOLI CROWNS            <- description
@@ -2430,6 +2437,135 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         return receipt
     }
 
+    /// Enforce arithmetic invariants on subtotal / tax that no real
+    /// receipt can violate. Runs AFTER label-based sanity checks — this
+    /// pass is for the cases where the labels were missing or pointed at
+    /// the same cross-wired junk FM emitted. The total is trusted here:
+    /// `sanityCheckTotal` has already cross-checked it against OCR.
+    ///
+    /// Observed corruption classes from the full-dataset audit:
+    ///   * tax == total  (Safeway tax-exempt groceries; FM copied the
+    ///     total into the tax slot — structurally impossible whenever
+    ///     any line item exists, since total = base + tax)
+    ///   * subtotal == tax  (ULTA: sub=1.47 tax=1.47 on a $25.97
+    ///     receipt; the real subtotal is total − tax = $24.50)
+    ///   * tax RATE parked in a money field (Burger King prints
+    ///     "9.375 TAX" — the % sign OCR'd away — and FM used 9.375 as
+    ///     the SUBTOTAL, then invented tax = total − 9.375 = 6.335, a
+    ///     fractional-cent amount no register ever prints)
+    ///   * tax > 30% of total (base-echo or misread survivors)
+    private static func reconcileTotalsArithmetic(
+        receipt input: Receipt,
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt {
+        var receipt = input
+        let total = receipt.totals.total
+        guard total > 0 else { return receipt }
+
+        let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
+        let taxCap: Decimal = total * Decimal(0.3)
+
+        func fractionalCents(_ v: Decimal) -> Bool {
+            var cents = v * 100
+            var rounded = Decimal()
+            NSDecimalRound(&rounded, &cents, 0, .plain)
+            return rounded != cents
+        }
+        func approxEqual(_ a: Decimal, _ b: Decimal) -> Bool {
+            let d = a - b
+            return d < Decimal(0.005) && d > Decimal(-0.005)
+        }
+
+        // Zero-valued subtotal is "not printed", not "$0.00".
+        if let s = receipt.totals.subtotal, s == 0 {
+            receipt.totals.subtotal = nil
+        }
+
+        // --- Rate parked in the subtotal slot (fractional cents in a
+        // plausible percent range). Recover both fields from the rate:
+        // subtotal = total / (1 + r/100), tax = the remainder.
+        if let s = receipt.totals.subtotal, fractionalCents(s),
+           s >= Decimal(2), s <= Decimal(12) {
+            let rate = NSDecimalNumber(decimal: s).doubleValue
+            let totalD = NSDecimalNumber(decimal: total).doubleValue
+            let subD = (totalD / (1.0 + rate / 100.0) * 100).rounded() / 100
+            let newSub = Decimal(subD)
+            let newTax = total - newSub
+            if newTax > 0, newTax <= taxCap {
+                receipt.totals.subtotal = newSub
+                receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: s, amount: newTax)]
+                receipt.provenance.fieldConfidence["totals.subtotal"] = 0.6
+                receipt.provenance.fieldConfidence["totals.tax"] = 0.6
+            }
+        }
+
+        let tax = receipt.totals.tax.first?.amount ?? 0
+
+        // --- tax == total with items present: impossible; the receipt
+        // is tax-exempt (or FM copied the wrong cell). Clear it.
+        if tax > 0, approxEqual(tax, total), !receipt.lineItems.isEmpty {
+            receipt.totals.tax = []
+        }
+
+        // --- subtotal == tax: one of them is a copy of the other. The
+        // real subtotal is total − tax when that remainder dominates
+        // the tax (subtotal ≥ tax on any real receipt — tax rates are
+        // nowhere near 50%).
+        if let s = receipt.totals.subtotal,
+           let x = receipt.totals.tax.first?.amount,
+           approxEqual(s, x) {
+            let candidate = total - x
+            if candidate >= x, x <= taxCap {
+                receipt.totals.subtotal = candidate
+                receipt.provenance.fieldConfidence["totals.subtotal"] = 0.6
+            } else {
+                // Tax itself is implausible too — drop both; arithmetic
+                // below may rebuild the tax from items.
+                receipt.totals.subtotal = nil
+                receipt.totals.tax = []
+            }
+        }
+
+        // --- Fractional-cent tax that survived: registers never print
+        // one. Rebuild from subtotal if possible, else drop.
+        if let x = receipt.totals.tax.first?.amount, fractionalCents(x) {
+            if let s = receipt.totals.subtotal, s < total, total - s <= taxCap {
+                receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: nil, amount: total - s)]
+                receipt.provenance.fieldConfidence["totals.tax"] = 0.6
+            } else {
+                receipt.totals.tax = []
+            }
+        }
+
+        // --- Tax still implausibly large: reassign the arithmetic
+        // remainder, choosing tax vs tip by which label the OCR
+        // actually prints (Philz: sub 10.75 + 2.15 on a "Tip" receipt
+        // is a tip, not tax).
+        if let x = receipt.totals.tax.first?.amount, x > taxCap {
+            let joined = lines.map { $0.text.lowercased() }.joined(separator: "\n")
+            let hasTipLabel = joined.range(of: #"\b(tip|gratuity)\b"#, options: .regularExpression) != nil
+            let hasTaxLabel = joined.range(of: #"\b(tax|vat|gst|hst)\b"#, options: .regularExpression) != nil
+            var remainder: Decimal? = nil
+            if let s = receipt.totals.subtotal, s < total, s >= total / 2 {
+                remainder = total - s
+            } else if itemsSum > 0, itemsSum < total, total - itemsSum <= taxCap {
+                remainder = total - itemsSum
+            }
+            if let r = remainder, hasTipLabel, !hasTaxLabel {
+                receipt.totals.tax = []
+                receipt.totals.tip = r
+                receipt.provenance.fieldConfidence["totals.tip"] = 0.6
+            } else if let r = remainder, r <= taxCap {
+                receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: nil, amount: r)]
+                receipt.provenance.fieldConfidence["totals.tax"] = 0.6
+            } else {
+                receipt.totals.tax = []
+            }
+        }
+
+        return receipt
+    }
+
     private static func sanityCheckTotal(
         receipt input: Receipt,
         lines: [(text: String, box: Receipt.BBox)]
@@ -3060,6 +3196,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         ]
         for sub in nonItemSubstrings {
             if lc.contains(sub) { return true }
+        }
+
+        // Pure percentage descriptions ("6.0000%", "9.375 %") — tax-rate
+        // rows next to the totals block, never products. ULTA's
+        // "6.0000%  24.50" row was extracting the SUBTOTAL as a $24.50
+        // line item named after the tax rate.
+        if trimmed.range(of: #"^\d+(?:[.,]\d+)?\s*%$"#, options: .regularExpression) != nil {
+            return true
         }
 
         // Weight-metadata rows on produce receipts: "1.31 lb @",
