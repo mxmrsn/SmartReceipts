@@ -1749,22 +1749,61 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
         }
 
+        /// Extract the first price-shaped token from any whitespace-
+        /// separated position in the text. Handles Vision merges like
+        /// "19.49 TAX: $" where the SUB-TOTAL's value ($19.49) is
+        /// embedded before the next label word.
+        func firstPriceToken(_ text: String) -> Decimal? {
+            for tok in text.split(whereSeparator: { $0.isWhitespace }) {
+                if let v = priceValue(String(tok)), v > 0 { return v }
+            }
+            return nil
+        }
+
         /// Find the price value paired with a label observation. Looks
-        /// same-row first (label + value in same obs, or same-Y sibling),
-        /// then row-above / row-below for receipts that print the value
-        /// on a separate line from the label.
+        /// same-row first (label + value in same obs, or same-Y sibling
+        /// preferring the closest sibling to the LEFT/RIGHT of the
+        /// label in reading order), then row-above / row-below for
+        /// receipts that print the value on a separate line from the
+        /// label.
         func findPairedValue(labelObs: (text: String, box: Receipt.BBox)) -> Decimal? {
             // Try tokens in the label observation itself.
             for tok in labelObs.text.split(whereSeparator: { $0.isWhitespace }) {
                 if let v = priceValue(String(tok)), v > 0 { return v }
             }
             let labelY = labelObs.box.y + labelObs.box.height / 2
-            let sameRowTol = max(0.008, labelObs.box.height * 0.9)
-            // Same-Y sibling.
+            let labelXEnd = labelObs.box.x + labelObs.box.width
+            // Tight same-Y tolerance: 0.006 or 0.5x label height,
+            // whichever is smaller. On stacked totals (Costco: values
+            // in a column with labels alongside, each label/value pair
+            // only ~0.010 apart), a looser tolerance would pull in the
+            // NEIGHBORING row's value.
+            let sameRowTol = min(0.006, max(labelObs.box.height * 0.5, 0.004))
+            // Same-Y siblings — sort by Y-distance first (closest same-
+            // row wins), then X distance (Vision often merges "value
+            // nextLabel" so the closer-X sibling in tie has the value
+            // for THIS label). IMG_4161's "SUB-TOTAL:$" + "19.49 TAX:
+            // $" + "1.92" is the classic case: the middle observation
+            // has the subtotal's value ($19.49) embedded.
+            var sameRow: [(text: String, x: Double, dy: Double)] = []
             for other in lines {
                 let cy = other.box.y + other.box.height / 2
-                guard abs(cy - labelY) <= sameRowTol else { continue }
-                if let v = priceValue(other.text), v > 0 { return v }
+                let dy = abs(cy - labelY)
+                guard dy <= sameRowTol else { continue }
+                if other.box.x == labelObs.box.x, other.box.y == labelObs.box.y { continue }
+                sameRow.append((other.text, other.box.x, dy))
+            }
+            sameRow.sort { a, b in
+                // Bucket dy so tiny baseline jitter doesn't dominate.
+                let aB = (a.dy / 0.003).rounded(.down)
+                let bB = (b.dy / 0.003).rounded(.down)
+                if aB != bB { return aB < bB }
+                let ad = a.x >= labelXEnd ? a.x - labelXEnd : labelXEnd - a.x + 10
+                let bd = b.x >= labelXEnd ? b.x - labelXEnd : labelXEnd - b.x + 10
+                return ad < bd
+            }
+            for sib in sameRow {
+                if let v = firstPriceToken(sib.text) { return v }
             }
             // Row immediately above OR below (Philz-style: value/label
             // pairs stacked vertically). Look within ~1.5 line heights.
@@ -1775,7 +1814,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 let cy = other.box.y + other.box.height / 2
                 let dy = abs(cy - labelY)
                 guard dy > sameRowTol, dy <= neighborTol else { continue }
-                guard let v = priceValue(other.text), v > 0 else { continue }
+                guard let v = firstPriceToken(other.text) else { continue }
                 if cy < labelY {
                     if bestAbove == nil || dy < bestAbove!.dy {
                         bestAbove = (dy, v)
@@ -1786,12 +1825,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     }
                 }
             }
-            // Prefer the closer of the two neighbors.
             switch (bestAbove, bestBelow) {
             case (nil, nil): return nil
             case (let a?, nil): return a.v
             case (nil, let b?): return b.v
-            case (let a?, let b?): return a.dy <= b.dy ? a.v : b.v
+            case (let a?, let b?):
+                // Slight preference for ABOVE — Philz Coffee prints
+                // values ABOVE their labels (Subtotal → $10.70 above,
+                // Tip → $2.14 above), and picking the "just-closer"
+                // BELOW value would grab the NEXT label's value. Only
+                // prefer BELOW when it's meaningfully closer (>5pt
+                // tighter than above).
+                return a.dy <= b.dy + 0.005 ? a.v : b.v
             }
         }
 
@@ -1805,10 +1850,25 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
 
         func findLabel(matching keywords: [String]) -> (text: String, box: Receipt.BBox)? {
+            // Allow prefix and (limited) suffix matching:
+            //   * "Subtotal $19.49" — prefix match ✓
+            //   * "Items Subtotal" — suffix match, but ONLY when the
+            //     first word is a WORD (not a number). "Items" is a
+            //     word so this matches; "19.49 TAX: $" has first
+            //     token "19.49" (a number) which would misattribute
+            //     the subtotal value to the TAX label.
+            func firstTokenIsWord(_ n: String) -> Bool {
+                let tokens = n.split(whereSeparator: { $0 == " " })
+                guard let first = tokens.first else { return false }
+                return Double(first) == nil
+            }
             for line in lines {
                 let n = normalizedLabel(line.text)
                 for kw in keywords {
-                    if n == kw || n.hasPrefix(kw + " ") || n.hasSuffix(" " + kw) {
+                    if n == kw || n.hasPrefix(kw + " ") {
+                        return (line.text, line.box)
+                    }
+                    if n.hasSuffix(" " + kw) && firstTokenIsWord(n) {
                         return (line.text, line.box)
                     }
                 }
@@ -1839,16 +1899,30 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
         }
 
-        // --- Tax --- (skip if we already have a positive extracted tax;
-        // tax has stronger heuristics in buildReceipt and multi-tax
-        // receipts can trip up a naive re-scan).
-        if receipt.totals.tax.first?.amount ?? 0 == 0,
-           let label = findLabel(matching: ["tax", "sales tax", "vat", "gst", "hst"]),
-           let v = findPairedValue(labelObs: label),
-           v > 0,
-           v < receipt.totals.total {
+        // --- Tax --- Two paths:
+        //   1. If we have an OCR tax label, use its adjacent value —
+        //      strongest signal, wins over anything buildReceipt
+        //      computed arithmetically.
+        //   2. If no OCR tax label AND the current tax equals the tip
+        //      we just extracted, the buildReceipt tax was a false
+        //      positive from arithmetic (real total was sub + tip,
+        //      but buildReceipt saw the tip amount and attributed it
+        //      to tax). Clear it.
+        let extractedTax = receipt.totals.tax.first?.amount ?? 0
+        let taxLabel = findLabel(matching: ["tax", "sales tax", "vat", "gst", "hst"])
+        if let label = taxLabel, let v = findPairedValue(labelObs: label),
+           v > 0, v < receipt.totals.total, v != extractedTax {
             receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: nil, amount: v)]
             receipt.provenance.fieldConfidence["totals.tax"] = 0.75
+        } else if taxLabel == nil,
+                  extractedTax > 0,
+                  let extractedTip = receipt.totals.tip,
+                  extractedTax == extractedTip {
+            // No tax label exists, but buildReceipt computed a tax
+            // that happens to equal the tip we found. This is the
+            // "sub + tip = total on a no-tax receipt" case (Philz
+            // Coffee IMG_7869); clear the ghost tax.
+            receipt.totals.tax = []
         }
 
         // Final consistency: if subtotal ends up equal to total (a
