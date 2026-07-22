@@ -95,12 +95,24 @@ Only 1 item extracted from a receipt with several. Layout unknown yet.
   `VNDetectDocumentSegmentation` + `CIPerspectiveCorrection`
   preprocessing for small/rotated receipts.
 - IMG_5046 (Safeway with metadata columns) — now perfect ($53.88 exact).
-  Fixed by rightmost-cluster column detection.
+  Fixed by rightmost-cluster column detection when X observations are
+  bimodal (metadata column at ~0.58, real prices at ~0.66).
+- IMG_1788 (Safeway with `Reguler Price` / `Menber Savings` / `Member
+  Sovings` typo variants) — was 3 metadata items summing $1.51 against
+  $31.77 total; now 7 real items summing $28.28 (only $3.49 short — a
+  price-fragment case where Vision split "3.49" into "3" and "49 S").
+  Fixed by Levenshtein-based fuzzy matching in the metadata filter
+  and the column-anchored labelYs precompute.
 - IMG_2460 (Safeway with GOYA/ADOBO fragmented prices) — dropped from
   $173 items-sum bogus down to $70.81 (still $4.68 short but reasonable).
   Fixed by split-price fragment merge.
 - IMG_5190, IMG_5785 misidentified as "Mobil" — merchant matcher now
   requires word boundaries so "Mobil" no longer matches "Mobile App".
+- IMG_1250 (In-N-Out DRIVE-Take Out subtotal treated as $14.15 item) —
+  sum dropped from $28.10 to $13.95 vs $16.21 total. The remaining $2.26
+  gap is a distinct issue (FM misreads "2 Hamburger" quantity). Fixed by
+  adding restaurant order-type phrases to totals-boundary + non-item
+  filters.
 
 ## Investigation notes
 
