@@ -94,11 +94,17 @@ All 1,183 receipts extract; 1,180 land in the dashboard (2 JPY
 receipts + 1 undated excluded from dollar/time charts). Remaining
 suspects worth a pass:
 
-- **8 receipts with implausible tax** that survived the guards
-  (tax == total, tax ≈ half of total, or tax echoing a fee):
-  IMG_5085, IMG_8567, IMG_7846, IMG_1430, IMG_5502, IMG_2109,
-  IMG_6219, IMG_5255. Mostly small totals where FM cross-wired
-  fields and no OCR label rescued them.
+- ~~8 receipts with implausible tax~~ — FIXED by
+  `reconcileTotalsArithmetic` (tax==total cleared on tax-exempt
+  runs; subtotal==tax recovered as total−tax; BK's 9.375% rate
+  recognized and decomposed; Philz remainder routed to TIP when
+  the receipt prints a Tip label). All 124 receipts matching any
+  suspect signature re-extracted; audit now reports zero
+  implausible-tax and zero fractional-cent values dataset-wide.
+  Note: several of the 8 still sit at conf 0.30 for a DIFFERENT
+  reason — item extraction (IMG_5255 items doubled, IMG_5085
+  over-extracted, IMG_2109 under-extracted). That's the next
+  frontier, not a totals problem.
 - **IMG_8142** — printed date unreadable (FM said "2026-03-00", OCR
   recovery found nothing valid). Honest sentinel; excluded from the
   time axis. Could fall back to photo EXIF date.
