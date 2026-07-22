@@ -1524,6 +1524,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let totalsKeywords: [String] = [
             "subtotal", "sub-total", "tax", "balance", "total",
             "amount due", "amount paid", "payment amount", "tip", "change",
+            // Restaurant / fast-food subtotal-summary rows. These
+            // aren't the grand total but they DO sit in the totals
+            // block above tax, and they carry a total-shaped price —
+            // if we don't mark them as totals boundary, column-
+            // anchored treats them as a line item (IMG_1250 In-N-Out:
+            // "DRIVE-Take Out 14.15" got picked up as an item for
+            // $14.15 above the actual $16.21 total).
+            "drive-take out", "drive thru", "drive-thru", "dine-in",
+            "dine in", "for here", "to go", "take out", "takeout",
         ]
         var totalsBlockY: Double = 1.0
         for line in lines {
@@ -2768,6 +2777,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             "additional discount",
             "instant savings",
             "promo savings",
+            // Restaurant order-type rows — In-N-Out prints
+            // "DRIVE-Take Out $14.15" as the subtotal display; not
+            // a purchased item. Same for other quick-serve receipts.
+            "drive-take out", "drive thru", "drive-thru",
+            "dine-in", "dine in", "for here", "to go",
+            "take out", "takeout", "take-out",
         ]
         if footerPhrases.contains(where: { lc.contains($0) }) { return true }
 
