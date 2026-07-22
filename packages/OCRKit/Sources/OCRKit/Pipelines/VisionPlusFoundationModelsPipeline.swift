@@ -1046,7 +1046,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ) -> Receipt.BBox? {
         let amountStr = NSDecimalNumber(decimal: amount).stringValue
         let keywords = keywords.map { $0.lowercased() }
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?$"#
 
         // Comma-vs-dot tolerant substring match. Receipts in regions that
         // use "," as the decimal separator ("4,00") wouldn't otherwise
@@ -1241,7 +1241,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         totalsValues: Set<Decimal>,
         receiptTotal: Decimal
     ) -> [Receipt.LineItem] {
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
 
         // Step 1: every price-shaped observation with its value.
         // Also flag whether the observation carried a tax-category
@@ -1269,7 +1269,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
             guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
-            guard v > 0 else { continue }
+            // Accept negative prices — they're legitimate line items
+            // (voided items, exchange credits, Safety Captain discounts,
+            // Ace Hardware EXCHNG credits, etc.). Column-anchored
+            // extraction should pick them up and record them as
+            // negative-valued LineItems so items_sum reconciles with
+            // total.
+            guard v != 0 else { continue }
             var marker = false
             if let re = taxMarkerSuffix {
                 let range = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
@@ -1358,7 +1364,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 // OCR baselines), while distinct items on other layouts
                 // (Target IMG_6855) are 0.012+ apart. A stricter gate
                 // keeps the dedup targeted at genuine pairs.
-                if dy < 0.005 {
+                // Only pair-dedup two same-sign values. A negative-value
+                // item (credit / voided) and a positive item shouldn't
+                // ever be paired even at the same Y — they're distinct
+                // rows.
+                let sameSign = (cur.value > 0 && nxt.value > 0) || (cur.value < 0 && nxt.value < 0)
+                if dy < 0.005 && sameSign {
                     // A pair. Keep whichever has the tax marker; if
                     // both/neither have markers, keep the smaller
                     // value (the paid price).
@@ -1387,8 +1398,16 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // Filter: implausibly large value. Vision sometimes mangles a
             // price like "$4.99" into just "99" (decimal point lost). The
             // resulting "$99" exceeds the receipt total and is obviously
-            // wrong. Drop anything that's strictly greater than the total.
-            if receiptTotal > 0, p.value > receiptTotal { continue }
+            // wrong. Ceiling depends on whether the receipt has any
+            // negative-value observations in the column: with credits
+            // present, big positive items (offset by negative ones) are
+            // legit (IMG_4161 Ace: CARBONATOR $34.99 + -$15.50 credit =
+            // $19.49 net); without credits, prices above total are almost
+            // always misreads (IMG_2460 Safeway: bogus $79 ADOBO from
+            // OCR noise).
+            let hasNegatives = pricePoints.contains { $0.value < 0 }
+            let ceilingFactor: Decimal = hasNegatives ? 3 : 1
+            if receiptTotal > 0, p.value > receiptTotal * ceilingFactor { continue }
 
             // Pick the BEST single text observation to the left, within
             // ±2 line-heights vertically. Strategy:
@@ -1489,7 +1508,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
 
         // Compute the price column from prices already matched to OCR.
         // Claim ONE OCR observation per extracted item. The set
@@ -1737,7 +1756,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
 
         func priceValue(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
@@ -1947,15 +1966,21 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         // Compute the arithmetic-expected total from line items + tax
         // - discount + tip. Items are the strongest signal we have when
-        // there are enough of them.
+        // there are enough of them. Track positives separately for the
+        // savings-block trigger: receipts with credit lines (negative
+        // items) push items_sum lower which would hide FM totals that
+        // came from a savings-block value.
         let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
+        let positivesSum: Decimal = receipt.lineItems.reduce(0) {
+            $1.totalPrice > 0 ? $0 + $1.totalPrice : $0
+        }
         let taxSum: Decimal = receipt.totals.tax.reduce(0) { $0 + $1.amount }
         let tip: Decimal = receipt.totals.tip ?? 0
         let discount: Decimal = receipt.totals.discount ?? 0
         let expected: Decimal = itemsSum + taxSum + tip - discount
 
         // Does FM's total actually appear anywhere in the OCR?
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
         func priceValue(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
@@ -1983,7 +2008,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // actual/regular price pairs before items_sum is computed.)
         let savingsBlockConfusion =
             receipt.lineItems.count >= 3
-            && itemsSum > fmTotal * Decimal(2)
+            && positivesSum > fmTotal * Decimal(2)
 
         // Flag 3: fmTotal implausibly large vs items — 5× or more.
         // IMG_5353 landed on $8851 for an 11-item Safeway; that's a
@@ -2287,7 +2312,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
 
         // Collect every "Regular Price" label Y-center.
         let regularLabels: [Double] = lines.compactMap { line in
@@ -2621,7 +2646,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
         guard !rowYs.isEmpty else { return [] }
 
-        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
         var out: [Decimal] = []
         for rowY in rowYs {
             // Tight tolerance — we want THIS row's price, not a neighbor's.
