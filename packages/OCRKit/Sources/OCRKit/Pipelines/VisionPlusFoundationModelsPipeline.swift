@@ -93,7 +93,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // item rows after row clustering, confusing the LLM. Stripping
         // them at the OCR level keeps the FM prompt focused on rows that
         // carry a description + price.
-        let prunedLines = Self.dropMetadataObservations(lines)
+        // Merge Vision-split price fragments ("2." + "79 S" — real
+        // $2.79 that Vision fractured across two observations). Runs
+        // before other filters so both this pipeline path and the
+        // column-anchored path (which re-normalizes) see the merged
+        // form. Without merge, "2." is discarded (not price-shaped)
+        // and "79 S" is treated as $79.
+        let mergedFragments = Self.mergeSplitPriceFragments(lines)
+        let prunedLines = Self.dropMetadataObservations(mergedFragments)
         // Drop pure-numeric OCR observations that are clearly SKU / UPC
         // codes printed alongside each line item ("037129013" on Target,
         // "643231511367" on Home Depot, etc.). These add noise to the
@@ -184,7 +191,9 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // "6. 49 S" with the spurious space — without normalization,
         // priceShape regexes reject the token and the item silently
         // vanishes from recovery (IMG_1326 B&J at $6.49).
-        let postLines = Self.normalizePriceTokens(lines)
+        // Apply the same fragment merge to the post-extraction lines
+        // used by buildReceipt / column-anchored / bbox attachment.
+        let postLines = Self.normalizePriceTokens(Self.mergeSplitPriceFragments(lines))
         var receipt = Self.buildReceipt(from: extracted, ocrLines: postLines)
         // PRIMARY line-item extraction: scan the price column directly.
         // The OCR data unambiguously tells us where the prices are. FM's
@@ -2826,6 +2835,87 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// 2 trailing digits + a word boundary so we don't accidentally
     /// rewrite phone numbers or dates ("555-1234" is left alone — no
     /// boundary after just 2 of those 4 digits).
+    /// Merge two adjacent OCR observations that are actually one split
+    /// price — Vision sometimes fractures "$2.79 S" into "2." at one X
+    /// and "79 S" at the next (same Y, tiny X gap). Without this repair
+    /// the "2." fragment is discarded (not price-shaped) and "79 S"
+    /// gets treated as $79, blowing up items_sum on Safeway receipts.
+    ///
+    /// Merge conditions:
+    ///   * LEFT observation matches `\d{1,3}\.` (digit(s) + dot only,
+    ///     nothing after the dot).
+    ///   * RIGHT observation matches `\d{1,3}(\s+[A-Z])?` (digits with
+    ///     optional tax marker suffix — no dot).
+    ///   * Same Y within 0.005.
+    ///   * X gap between LEFT.rightEdge and RIGHT.leftEdge ≤ 0.02.
+    /// When matched, the LEFT observation's text becomes the merged
+    /// price (e.g. "2.79 S") and the RIGHT observation is dropped.
+    /// LEFT's bounding box is extended to cover the RIGHT observation
+    /// so bbox display and column-X detection still work.
+    fileprivate static func mergeSplitPriceFragments(
+        _ lines: [(text: String, box: Receipt.BBox)]
+    ) -> [(text: String, box: Receipt.BBox)] {
+        guard let leftRe = try? NSRegularExpression(
+            pattern: #"^\s*(\d{1,3})\.\s*$"#, options: []
+        ), let rightRe = try? NSRegularExpression(
+            pattern: #"^\s*(\d{1,3})(\s+[A-Z])?\s*$"#, options: []
+        ) else { return lines }
+
+        var out = lines
+        var claimed: Set<Int> = []
+        for i in 0..<out.count {
+            let l = out[i]
+            let lRange = NSRange(l.text.startIndex..<l.text.endIndex, in: l.text)
+            guard let lm = leftRe.firstMatch(in: l.text, options: [], range: lRange),
+                  let lDigits = Range(lm.range(at: 1), in: l.text)
+            else { continue }
+            let leftValue = String(l.text[lDigits])
+            let leftCy = l.box.y + l.box.height / 2
+            let leftXEnd = l.box.x + l.box.width
+
+            for j in 0..<out.count where j != i && !claimed.contains(j) {
+                let r = out[j]
+                let rCy = r.box.y + r.box.height / 2
+                guard abs(rCy - leftCy) <= 0.005 else { continue }
+                guard r.box.x >= l.box.x else { continue }
+                let gap = r.box.x - leftXEnd
+                guard gap <= 0.02 else { continue }
+                let rRange = NSRange(r.text.startIndex..<r.text.endIndex, in: r.text)
+                guard let rm = rightRe.firstMatch(in: r.text, options: [], range: rRange),
+                      let rDigits = Range(rm.range(at: 1), in: r.text)
+                else { continue }
+                // Require exactly 2 digits on the right for a
+                // legitimate cents fragment — "79" merges with "2.",
+                // but "2" alone wouldn't (that'd be pennies).
+                let digits = String(r.text[rDigits])
+                guard digits.count == 2 else { continue }
+                // Suffix (tax marker) if present.
+                var suffix = ""
+                if rm.range(at: 2).location != NSNotFound,
+                   let sufRange = Range(rm.range(at: 2), in: r.text) {
+                    suffix = String(r.text[sufRange])
+                }
+                // Merge into LEFT.
+                let mergedText = "\(leftValue).\(digits)\(suffix)"
+                let mergedBox = Receipt.BBox(
+                    x: l.box.x,
+                    y: min(l.box.y, r.box.y),
+                    width: (r.box.x + r.box.width) - l.box.x,
+                    height: max(l.box.y + l.box.height, r.box.y + r.box.height) - min(l.box.y, r.box.y)
+                )
+                out[i] = (text: mergedText, box: mergedBox)
+                claimed.insert(j)
+                break
+            }
+        }
+        // Drop the claimed RIGHT observations.
+        var result: [(text: String, box: Receipt.BBox)] = []
+        for (idx, l) in out.enumerated() where !claimed.contains(idx) {
+            result.append(l)
+        }
+        return result
+    }
+
     fileprivate static func normalizePriceTokens(
         _ lines: [(text: String, box: Receipt.BBox)]
     ) -> [(text: String, box: Receipt.BBox)] {
