@@ -225,6 +225,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // OCR is clear about which label goes with which value, we
         // should trust that over FM.
         receipt = Self.sanityCheckSubtotalTaxTip(receipt: receipt, lines: postLines)
+        // Sprouts (and other weight-priced grocery) receipts print
+        // weight-based line items as a stack of THREE observations:
+        //   BROCCOLI CROWNS            <- description
+        //   1.15 lb @                  <- weight × marker
+        //   $1.99 / lb                 <- unit price
+        // and the actual paid total (weight × unit) appears in the
+        // price column at a nearby Y. FM sometimes emits the WEIGHT
+        // (1.15) as the totalPrice instead of the computed total
+        // (2.29). Recompute from OCR when we can find both the weight
+        // observation and the unit-price observation adjacent to the
+        // item's description.
+        receipt = Self.correctWeightPricedItems(receipt: receipt, lines: postLines)
         // Snap merchant to a canonical brand name when we can identify one
         // in the OCR header. Catches FM picking a city ("Colma" for
         // "Target Colma"), an OCR misread ("how doers" for "Home Depot"),
@@ -2070,6 +2082,129 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         receipt.totals.total = best.value
         receipt.provenance.fieldConfidence["totals.total"] = 0.7
+        return receipt
+    }
+
+    /// Recompute totalPrice from weight × unit for Sprouts-style
+    /// weight-priced items.
+    ///
+    /// Sprouts prints each weight item as three stacked observations:
+    ///
+    ///     BROCCOLI CROWNS      <- description
+    ///     1.15 lb @            <- weight X.XX + " lb @"
+    ///     $1.99 / lb           <- unit price " $Y.YY / lb"
+    ///
+    /// with the paid total (X.XX × Y.YY) shown in the price column
+    /// at a nearby Y. FM sometimes grabs the weight (1.15) as the
+    /// totalPrice instead of the computed total ($2.29). Detect and
+    /// correct.
+    ///
+    /// For each extracted line item, find its description observation
+    /// in the OCR. Look within ±0.03 Y for BOTH:
+    ///   (a) a weight observation matching `\d+\.\d{1,2}\s*lb\s*@`
+    ///   (b) a unit-price observation matching `\$?\d+\.\d{1,2}\s*/\s*(?:lb|1b)`
+    /// If both exist, compute weight × unit and compare to the item's
+    /// current totalPrice. When they differ by more than 1%, replace.
+    private static func correctWeightPricedItems(
+        receipt input: Receipt,
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt {
+        var receipt = input
+        guard !receipt.lineItems.isEmpty else { return receipt }
+
+        // Regex captures: 1 = weight value.
+        let weightRe = try? NSRegularExpression(
+            pattern: #"(\d+(?:\.\d{1,2})?)\s*lb\s*@"#,
+            options: [.caseInsensitive]
+        )
+        // Regex captures: 1 = unit price. Accepts "$1.99 / lb" as one
+        // observation OR just "$1.99 /" when Vision splits the "lb"
+        // suffix onto its own observation (Sprouts small-font).
+        let unitRe = try? NSRegularExpression(
+            pattern: #"\$?(\d+(?:[.,]\d{1,2})?)\s*/(?:\s*(?:lb|1b|ib))?\s*$"#,
+            options: [.caseInsensitive]
+        )
+        guard let weightRe, let unitRe else { return receipt }
+
+        func matchFirst(_ re: NSRegularExpression, in text: String) -> Decimal? {
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            guard let m = re.firstMatch(in: text, options: [], range: range),
+                  m.numberOfRanges >= 2,
+                  let captureRange = Range(m.range(at: 1), in: text)
+            else { return nil }
+            let raw = String(text[captureRange]).replacingOccurrences(of: ",", with: ".")
+            return Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX"))
+        }
+
+        for i in receipt.lineItems.indices {
+            let item = receipt.lineItems[i]
+            let desc = item.description.lowercased().trimmingCharacters(in: .whitespaces)
+            guard !desc.isEmpty else { continue }
+            let descWords = desc
+                .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+                .map(String.init)
+                .filter { $0.count >= 3 }
+
+            // Find the description's OCR row(s).
+            var descYs: [Double] = []
+            for line in lines {
+                let lc = line.text.lowercased()
+                let strict = lc.contains(desc)
+                let fuzzy = !descWords.isEmpty && descWords.allSatisfy { lc.contains($0) }
+                if strict || fuzzy {
+                    descYs.append(line.box.y + line.box.height / 2)
+                }
+            }
+            guard let descY = descYs.min() else { continue }
+
+            // Search ±0.03 Y around the description for weight AND unit.
+            var weight: Decimal? = nil
+            var unit: Decimal? = nil
+            for line in lines {
+                let cy = line.box.y + line.box.height / 2
+                guard abs(cy - descY) <= 0.03 else { continue }
+                if weight == nil, let w = matchFirst(weightRe, in: line.text) {
+                    weight = w
+                }
+                if unit == nil, let u = matchFirst(unitRe, in: line.text) {
+                    unit = u
+                }
+                if weight != nil, unit != nil { break }
+            }
+            guard let weight, let unit, weight > 0, unit > 0 else { continue }
+
+            let computed = weight * unit
+            // Round to cents.
+            var rounded: Decimal = 0
+            var mut = computed
+            NSDecimalRound(&rounded, &mut, 2, .plain)
+            // Only override when the current totalPrice EQUALS the
+            // weight (within 5c) — that's the specific "FM picked the
+            // weight as the price" signal we want to catch. On dense
+            // Sprouts receipts where multiple items' weight/unit
+            // observations overlap in the ±0.03 Y search window, this
+            // conservative gate keeps us from clobbering already-
+            // correct items (ORG CURLY PARSLEY was $5.97 = 3 × $1.99,
+            // shouldn't be recomputed to 1.15 × 1.99 = $2.29 just
+            // because BROCCOLI's weight/unit sit nearby).
+            let weightDiff = item.totalPrice > weight
+                ? item.totalPrice - weight
+                : weight - item.totalPrice
+            guard weightDiff < Decimal(0.05) else { continue }
+            // Also require the computed result to differ from current —
+            // no need to touch items where FM already emitted the same
+            // value from weight coincidence.
+            let diff = item.totalPrice > rounded ? item.totalPrice - rounded : rounded - item.totalPrice
+            guard diff > Decimal(0.01) else { continue }
+
+            receipt.lineItems[i] = Receipt.LineItem(
+                description: item.description,
+                quantity: weight,
+                unitPrice: unit,
+                totalPrice: rounded,
+                category: item.category
+            )
+        }
         return receipt
     }
 
