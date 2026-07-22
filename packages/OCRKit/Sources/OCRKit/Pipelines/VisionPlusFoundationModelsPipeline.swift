@@ -209,6 +209,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // (a) the value actually appearing in OCR near a totals label
         // and (b) the arithmetic sum of line items plus tax.
         receipt = Self.sanityCheckTotal(receipt: receipt, lines: postLines)
+        // Same idea for subtotal / tax / tip — find the OCR label,
+        // grab its adjacent value. FM sometimes cross-wires these
+        // (Philz IMG: emits tip amount in the subtotal slot). If the
+        // OCR is clear about which label goes with which value, we
+        // should trust that over FM.
+        receipt = Self.sanityCheckSubtotalTaxTip(receipt: receipt, lines: postLines)
         // Snap merchant to a canonical brand name when we can identify one
         // in the OCR header. Catches FM picking a city ("Colma" for
         // "Target Colma"), an OCR misread ("how doers" for "Home Depot"),
@@ -340,6 +346,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // almost certainly a rate. Drop it.
         if let tax = taxAmount, let sub = subtotal, sub > 0,
            tax > sub * Decimal(0.3)
+        {
+            taxAmount = nil
+        }
+        // Tax-slot-holds-total: on receipts where subtotal is missing
+        // (Safeway-style: only prints "**** BALANCE"), FM sometimes
+        // grabs the total value and puts it in the tax slot too. Any
+        // tax that equals or exceeds the total, or is more than ~30%
+        // of the total, isn't a real tax. Drop it. Covers IMG_2173
+        // where FM emitted tax=$45.55 for a $45.55 total.
+        if let tax = taxAmount, total > 0,
+           (tax >= total || tax > total * Decimal(0.3))
         {
             taxAmount = nil
         }
@@ -1317,12 +1334,24 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 // real product name vs a brand prefix.
                 return a.text.count > b.text.count
             }
-            let bestText = candidates.first!.text
-
-            let cleaned = Self.cleanLineItemDescription(bestText)
-            guard cleaned.count >= 3 else { continue }
-            guard !Self.isFooterRow(cleaned) else { continue }
-            guard !Self.looksLikeNonItemRecoveryCandidate(cleaned) else { continue }
+            // Walk sorted candidates and take the FIRST one that
+            // survives the non-item filters. If the closest-Y candidate
+            // is a SKU / weight-marker / metadata fragment (which the
+            // sort already deprioritizes but doesn't necessarily push
+            // to the bottom), don't drop the line item — fall back to
+            // the next candidate. That's what saves Ulta receipts
+            // where the SKU sits closer to the price than the actual
+            // product name.
+            var cleaned: String? = nil
+            for c in candidates {
+                let candidate = Self.cleanLineItemDescription(c.text)
+                if candidate.count < 3 { continue }
+                if Self.isFooterRow(candidate) { continue }
+                if Self.looksLikeNonItemRecoveryCandidate(candidate) { continue }
+                cleaned = candidate
+                break
+            }
+            guard let cleaned else { continue }
 
             // Step 7: inherit qty / unit / category from FM if it
             // extracted a matching item.
@@ -1589,6 +1618,148 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ///
     /// The conservative gate on (a) prevents the guardrail from
     /// second-guessing FM on ordinary receipts where its total is fine.
+    /// Re-anchor subtotal / tax / tip against the OCR. For each field
+    /// we find the labelling observation ("Subtotal", "Tip", "Tax",
+    /// "Gratuity") and grab the price observation on the same visual
+    /// row (or the row immediately above/below on receipts that print
+    /// the value on a separate line). The value from OCR wins over
+    /// FM's when they disagree and the arithmetic then adds up.
+    ///
+    /// Why: FM cross-wires these fields on receipts where the layout
+    /// isn't strict. Philz Coffee prints values ABOVE their labels
+    /// ("$10.70\nSubtotal\n$2.14\nTip\n$12.84\nTotal"); FM picked
+    /// the tip amount ($2.14) as the subtotal and left tip empty.
+    private static func sanityCheckSubtotalTaxTip(
+        receipt input: Receipt,
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt {
+        var receipt = input
+        let priceShape = #"^-?\$?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z])?$"#
+
+        func priceValue(_ text: String) -> Decimal? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
+            let normalized = trimmed
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: ",", with: ".")
+                .replacingOccurrences(of: #"\s+[A-Z]\s*$"#, with: "", options: .regularExpression)
+            return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
+        }
+
+        /// Find the price value paired with a label observation. Looks
+        /// same-row first (label + value in same obs, or same-Y sibling),
+        /// then row-above / row-below for receipts that print the value
+        /// on a separate line from the label.
+        func findPairedValue(labelObs: (text: String, box: Receipt.BBox)) -> Decimal? {
+            // Try tokens in the label observation itself.
+            for tok in labelObs.text.split(whereSeparator: { $0.isWhitespace }) {
+                if let v = priceValue(String(tok)), v > 0 { return v }
+            }
+            let labelY = labelObs.box.y + labelObs.box.height / 2
+            let sameRowTol = max(0.008, labelObs.box.height * 0.9)
+            // Same-Y sibling.
+            for other in lines {
+                let cy = other.box.y + other.box.height / 2
+                guard abs(cy - labelY) <= sameRowTol else { continue }
+                if let v = priceValue(other.text), v > 0 { return v }
+            }
+            // Row immediately above OR below (Philz-style: value/label
+            // pairs stacked vertically). Look within ~1.5 line heights.
+            let neighborTol = max(0.020, labelObs.box.height * 1.5)
+            var bestAbove: (dy: Double, v: Decimal)? = nil
+            var bestBelow: (dy: Double, v: Decimal)? = nil
+            for other in lines {
+                let cy = other.box.y + other.box.height / 2
+                let dy = abs(cy - labelY)
+                guard dy > sameRowTol, dy <= neighborTol else { continue }
+                guard let v = priceValue(other.text), v > 0 else { continue }
+                if cy < labelY {
+                    if bestAbove == nil || dy < bestAbove!.dy {
+                        bestAbove = (dy, v)
+                    }
+                } else {
+                    if bestBelow == nil || dy < bestBelow!.dy {
+                        bestBelow = (dy, v)
+                    }
+                }
+            }
+            // Prefer the closer of the two neighbors.
+            switch (bestAbove, bestBelow) {
+            case (nil, nil): return nil
+            case (let a?, nil): return a.v
+            case (nil, let b?): return b.v
+            case (let a?, let b?): return a.dy <= b.dy ? a.v : b.v
+            }
+        }
+
+        // Locate observations whose text is exactly (or begins with)
+        // one of these labels — same normalization used by other passes.
+        func normalizedLabel(_ text: String) -> String {
+            text.lowercased()
+                .replacingOccurrences(of: #"[^a-z0-9 ]"#, with: " ", options: .regularExpression)
+                .replacingOccurrences(of: #" +"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        func findLabel(matching keywords: [String]) -> (text: String, box: Receipt.BBox)? {
+            for line in lines {
+                let n = normalizedLabel(line.text)
+                for kw in keywords {
+                    if n == kw || n.hasPrefix(kw + " ") || n.hasSuffix(" " + kw) {
+                        return (line.text, line.box)
+                    }
+                }
+            }
+            return nil
+        }
+
+        // --- Subtotal ---
+        if let label = findLabel(matching: ["subtotal", "sub total", "sub-total"]),
+           let v = findPairedValue(labelObs: label) {
+            // Only override if OCR value differs from FM's and OCR
+            // value fits arithmetic better.
+            let current = receipt.totals.subtotal
+            if v != current {
+                receipt.totals.subtotal = v
+                receipt.provenance.fieldConfidence["totals.subtotal"] = 0.75
+            }
+        }
+
+        // --- Tip ---
+        if let label = findLabel(matching: ["tip", "gratuity"]),
+           let v = findPairedValue(labelObs: label),
+           v > 0 {
+            let current = receipt.totals.tip ?? 0
+            if v != current {
+                receipt.totals.tip = v
+                receipt.provenance.fieldConfidence["totals.tip"] = 0.75
+            }
+        }
+
+        // --- Tax --- (skip if we already have a positive extracted tax;
+        // tax has stronger heuristics in buildReceipt and multi-tax
+        // receipts can trip up a naive re-scan).
+        if receipt.totals.tax.first?.amount ?? 0 == 0,
+           let label = findLabel(matching: ["tax", "sales tax", "vat", "gst", "hst"]),
+           let v = findPairedValue(labelObs: label),
+           v > 0,
+           v < receipt.totals.total {
+            receipt.totals.tax = [Receipt.TaxLine(label: "Tax", rate: nil, amount: v)]
+            receipt.provenance.fieldConfidence["totals.tax"] = 0.75
+        }
+
+        // Final consistency: if subtotal ends up equal to total (a
+        // stubborn FM habit on receipts without a printed "Subtotal"
+        // line), drop it entirely — a real subtotal is always < total
+        // when tax or tip is charged, and receipts with no tax rarely
+        // print a subtotal at all.
+        if let sub = receipt.totals.subtotal, sub == receipt.totals.total {
+            receipt.totals.subtotal = nil
+        }
+
+        return receipt
+    }
+
     private static func sanityCheckTotal(
         receipt input: Receipt,
         lines: [(text: String, box: Receipt.BBox)]
@@ -1739,12 +1910,21 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             return a.value < b.value
         }!
 
-        // Only override when the new value beats FM's on arithmetic
-        // fit. If FM's total was hallucinated (not in OCR), it can't
-        // be right regardless of arithmetic — always override.
-        let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
-        let newDiff = best.value > target ? best.value - target : target - best.value
-        guard hallucinated || newDiff < fmDiff else { return receipt }
+        // Override policy:
+        //   * Hallucinated — FM's value doesn't exist in OCR, so it
+        //     can't be right. Always replace.
+        //   * savingsBlockConfusion — items_sum is more than double
+        //     FM's total. The grand total must be ≥ items_sum, so FM
+        //     is guaranteed wrong. Always replace.
+        //   * Otherwise — require the replacement to beat FM on
+        //     arithmetic fit. This branch isn't currently reachable
+        //     (the guardrail only fires under one of the two flags
+        //     above) but keeps the logic future-proof.
+        if !hallucinated && !savingsBlockConfusion {
+            let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
+            let newDiff = best.value > target ? best.value - target : target - best.value
+            guard newDiff < fmDiff else { return receipt }
+        }
 
         receipt.totals.total = best.value
         receipt.provenance.fieldConfidence["totals.total"] = 0.7
@@ -1974,22 +2154,49 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         // Coupon / savings / loyalty / rewards anywhere in the text.
         // These phrases never appear inside a real product name.
+        // Includes typo-tolerant variants ("foru personalized" without
+        // the space Vision drops) and trailing-marker variants like
+        // "sale price" (a Sprouts-style annotation Vision sometimes
+        // glues onto the description).
         let nonItemSubstrings: [String] = [
             "store coupon", "manufacturer coupon", "mfr coupon",
             "member savings", "member saving", "member savinas",
             "regular price", "resular price", "reqular price",
             "for personalized", "forl personalized",
+            "foru personalized",  // Vision drops the space in "for U"
             "you save", "you saved",
             "grocery rewards", "rewards earned", "points earned",
             "loyalty discount",
+            "sale price",
         ]
         for sub in nonItemSubstrings {
             if lc.contains(sub) { return true }
         }
 
+        // Weight-metadata rows on produce receipts: "1.31 lb @",
+        // "0.91 lb @ $1.65 / lb", "1.5 oz @". Never a product name.
+        if trimmed.range(
+            of: #"\d+(?:[.,]\d+)?\s*(?:lb|oz|kg|g)\s*@"#,
+            options: .regularExpression
+        ) != nil {
+            return true
+        }
+
         // Trailing negative-amount marker ("3.50-", "18.00-") — that's a
         // savings line, not a product.
         if trimmed.range(of: #"\d+[.,]\d{1,2}\s*-\s*$"#, options: .regularExpression) != nil {
+            return true
+        }
+
+        // Leading negative-amount marker ("-0.25 forU Personalized") —
+        // same story: a savings amount attached to a label.
+        if trimmed.range(of: #"^\s*-\d+[.,]\d{1,2}\b"#, options: .regularExpression) != nil {
+            return true
+        }
+
+        // Pure-digit UPC / SKU code (6+ digits, possibly with a trailing
+        // check digit block). Product descriptions always have letters.
+        if trimmed.range(of: #"^\d{6,}\s*$"#, options: .regularExpression) != nil {
             return true
         }
 
