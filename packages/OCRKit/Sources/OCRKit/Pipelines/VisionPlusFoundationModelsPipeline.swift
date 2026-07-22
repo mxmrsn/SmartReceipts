@@ -307,7 +307,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // totals block, regular-price labels, and savings markers. FM's
         // items are still used as a HINT source for quantity/unit/category.
         let fmItems = receipt.lineItems
-        let columnItems = Self.columnAnchoredLineItems(
+        let (columnItems, rejectedPoints) = Self.columnAnchoredLineItems(
             lines: postLines,
             fmItems: fmItems,
             totalsValues: Self.totalsValueSet(from: receipt),
@@ -416,6 +416,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // original observation either way.
         receipt = Self.attachBBoxes(receipt: receipt, lines: postLines)
 
+        // Checksum repair: the receipt's own arithmetic (items sum to
+        // subtotal / total) is a printed checksum. When the final item
+        // list misses it by EXACTLY one item's price (phantom) or one
+        // rejected price point's value (wrong rejection), make that
+        // single conservative move. Exact-match + uniqueness gates keep
+        // coincidence repairs out.
+        receipt = Self.balanceItemsAgainstChecksum(
+            receipt: receipt,
+            rejects: rejectedPoints,
+            lines: postLines
+        )
         // Late arithmetic pass, AFTER all item filtering has settled:
         // when the items independently sum to the printed total, any
         // nonzero tax / tip / discount is arithmetically impossible —
@@ -570,6 +581,105 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
         }
         return nil
+    }
+
+    /// Single-move checksum repair against the receipt's own arithmetic.
+    ///
+    /// Target: the printed subtotal when we have one (it IS the items
+    /// sum, pre-tax), else total − tax − tip + discount. If the final
+    /// items miss the target, attempt exactly ONE repair:
+    ///
+    ///   * OVER by exactly one item's price → that item is a phantom
+    ///     (duplicated price row, stolen footer value). Drop it — but
+    ///     only when precisely one item matches the delta, so we never
+    ///     guess between candidates.
+    ///   * UNDER by exactly one rejected price point's value → that
+    ///     rejection was wrong. Re-admit it with the nearest left-side
+    ///     text as description. Again, only on a unique match.
+    ///
+    /// The exactness requirement (± 1¢) is the safety: an arbitrary
+    /// wrong item/reject matching the residual to the cent is unlikely,
+    /// and the uniqueness gate refuses ambiguous repairs outright.
+    private static func balanceItemsAgainstChecksum(
+        receipt input: Receipt,
+        rejects: [RejectedPricePoint],
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Receipt {
+        var receipt = input
+        let total = receipt.totals.total
+        guard total > 0, receipt.lineItems.count >= 2 else { return receipt }
+
+        let tax = receipt.totals.tax.first?.amount ?? 0
+        let tip = receipt.totals.tip ?? 0
+        let discount = receipt.totals.discount ?? 0
+        // Prefer the printed subtotal as the items target; it's the
+        // direct checksum. Guard against degenerate subtotals (≤ 0,
+        // or ≥ total with tax present).
+        let target: Decimal = {
+            if let s = receipt.totals.subtotal, s > 0, s <= total { return s }
+            return total - tax - tip + discount
+        }()
+        guard target > 0 else { return receipt }
+
+        let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
+        let delta = itemsSum - target
+        let tol = Decimal(0.011)
+        let absDelta = delta < 0 ? -delta : delta
+        // Already balanced, or so far off that a single move can't be
+        // trusted to explain it.
+        guard absDelta > tol else { return receipt }
+
+        func approx(_ a: Decimal, _ b: Decimal) -> Bool {
+            let d = a - b
+            return d < tol && d > -tol
+        }
+
+        if delta > 0 {
+            // OVER: drop the unique item whose price equals the excess.
+            let matches = receipt.lineItems.enumerated().filter { approx($0.element.totalPrice, delta) }
+            if matches.count == 1 {
+                receipt.lineItems.remove(at: matches[0].offset)
+            }
+            return receipt
+        }
+
+        // UNDER: re-admit the unique rejected price point whose value
+        // equals the shortfall. Dedupe rejects by (value, centerY) —
+        // the same point can be rejected at multiple gates.
+        let needed = -delta
+        var seen = Set<String>()
+        let candidates = rejects.filter { rp in
+            guard rp.value > 0, approx(rp.value, needed) else { return false }
+            let key = "\(rp.value)@\(Int((rp.centerY * 1000).rounded()))"
+            return seen.insert(key).inserted
+        }
+        guard candidates.count == 1, let point = candidates.first else { return receipt }
+
+        // Nearest non-price text to the left for the description.
+        let priceShape = #"^-?\$?-?\d{1,5}[.,]\d{1,2}(?:\s+[A-Z])?$"#
+        var bestDesc: (text: String, dy: Double)? = nil
+        for line in lines {
+            let cy = line.box.y + line.box.height / 2
+            let dy = abs(cy - point.centerY)
+            guard dy <= max(0.012, point.box.height * 2.0) else { continue }
+            guard line.box.x < point.box.x else { continue }
+            let t = line.text.trimmingCharacters(in: .whitespaces)
+            guard t.count >= 3 else { continue }
+            if t.range(of: priceShape, options: .regularExpression) != nil { continue }
+            if bestDesc == nil || dy < bestDesc!.dy {
+                bestDesc = (t, dy)
+            }
+        }
+        guard let desc = bestDesc.map({ Self.cleanLineItemDescription($0.text) }),
+              desc.count >= 3 else { return receipt }
+        receipt.lineItems.append(Receipt.LineItem(
+            description: desc,
+            quantity: nil,
+            unitPrice: nil,
+            totalPrice: point.value,
+            category: nil
+        ))
+        return receipt
     }
 
     /// See call site: clears phantom tax / tip / discount when the final
@@ -1698,14 +1808,25 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ///   7. Match against FM's items by (price equal, description
     ///      prefix overlap) to inherit quantity / unitPrice / category.
     ///
-    /// Returns empty when fewer than 2 prices land in the column —
+    /// A price observation that column-anchored extraction REJECTED, and
+    /// where. The arithmetic-balance pass uses these: when the final
+    /// items fall short of the receipt's own subtotal/total by exactly
+    /// one rejected value, that rejection was wrong — the value both
+    /// exists in the price column and completes the checksum.
+    struct RejectedPricePoint {
+        let value: Decimal
+        let centerY: Double
+        let box: Receipt.BBox
+    }
+
+    /// Returns empty items when fewer than 2 prices land in the column —
     /// caller falls back to the FM-only path.
     private static func columnAnchoredLineItems(
         lines: [(text: String, box: Receipt.BBox)],
         fmItems: [Receipt.LineItem],
         totalsValues: Set<Decimal>,
         receiptTotal: Decimal
-    ) -> [Receipt.LineItem] {
+    ) -> (items: [Receipt.LineItem], rejects: [RejectedPricePoint]) {
         // Require decimal cents in column-anchored price detection.
         // Integer-only prices like "79 S" are almost always OCR
         // fragments of a longer price ("2.79 S" split by Vision into
@@ -1762,7 +1883,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 hasTaxMarker: marker
             ))
         }
-        guard pricePoints.count >= 2 else { return [] }
+        guard pricePoints.count >= 2 else { return ([], []) }
+        var rejects: [RejectedPricePoint] = []
 
         // Step 1b: identify the price column.
         //
@@ -1898,6 +2020,10 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                         if !cur.hasTaxMarker && nxt.hasTaxMarker { return nxt }
                         return cur.value <= nxt.value ? cur : nxt
                     }()
+                    let loser = keeper.lineIdx == cur.lineIdx ? nxt : cur
+                    rejects.append(RejectedPricePoint(
+                        value: loser.value, centerY: loser.centerY, box: loser.box
+                    ))
                     inColumn.append(keeper)
                     i += 2
                     continue
@@ -1908,13 +2034,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
 
         var items: [Receipt.LineItem] = []
+        func reject(_ p: PricePoint) {
+            rejects.append(RejectedPricePoint(value: p.value, centerY: p.centerY, box: p.box))
+        }
         for p in inColumn {
-            // Filter: below the totals block.
+            // Filter: below the totals block. NOT added to the rejects
+            // ledger — payment / change / tender rows must never be
+            // re-admitted as items, even when they'd balance the books.
             if p.centerY >= totalsBlockY - 0.002 { continue }
-            // Filter: equals a known totals value.
+            // Filter: equals a known totals value. Also not re-admittable.
             if totalsValues.contains(p.value) { continue }
             // Filter: adjacent to a regular-price / member-savings label.
-            if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { continue }
+            if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { reject(p); continue }
             // Filter: implausibly large value. Vision sometimes mangles a
             // price like "$4.99" into just "99" (decimal point lost). The
             // resulting "$99" exceeds the receipt total and is obviously
@@ -1955,7 +2086,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 if t.range(of: priceShape, options: .regularExpression) != nil { continue }
                 candidates.append((t, line.box.x, dy))
             }
-            guard !candidates.isEmpty else { continue }
+            guard !candidates.isEmpty else { reject(p); continue }
 
             candidates.sort { a, b in
                 // Bucket dy by 0.005 — descriptions on truly the same row
@@ -1989,7 +2120,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     (c.dy / 0.005).rounded(.down) == closestBucket
                         && Self.labelOwnsPrice(c.text)
                 }
-                if owned { continue }
+                if owned { reject(p); continue }
             }
 
             // Walk sorted candidates and take the FIRST one that
@@ -2014,7 +2145,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 cleaned = candidate
                 break
             }
-            guard let cleaned else { continue }
+            guard let cleaned else { reject(p); continue }
 
             // Step 7: inherit qty / unit / category from FM if it
             // extracted a matching item.
@@ -2034,7 +2165,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             ))
         }
 
-        return items
+        return (items, rejects)
     }
 
     /// True when a text observation is a money-summary label that owns
