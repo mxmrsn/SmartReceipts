@@ -2717,8 +2717,21 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // closing the gap, the row is no longer price-shaped and the
         // item silently disappears from extraction.
         let spaceAfterDotPattern = #"(\d)\.\s+(\d{2})\b"#
+        // (3) "$" misread as "8" or "5" — the S-with-vertical-bar shape
+        // of a dollar sign often OCRs as one of those digits.
+        // Detected specifically as the paired SALE/REG pattern Ace
+        // Hardware prints:  "$21.99 $21.99" comes through as
+        // "821.99 521.99" (or "521.99 821.99"). Both tokens strip to
+        // the same underlying value, which is a very strong signal
+        // that we're looking at misread dollar signs. Rewriting the
+        // observation to a valid single price lets column-anchored
+        // extraction see the item's real price.
+        let paired58 = try? NSRegularExpression(
+            pattern: #"^\s*[58](\d{1,4}[.,]\d{2})\s+[58](\d{1,4}[.,]\d{2})\s*$"#,
+            options: []
+        )
         return lines.map { line in
-            let normalized = line.text
+            var text = line.text
                 .replacingOccurrences(
                     of: hyphenPattern,
                     with: "$1.$2",
@@ -2729,7 +2742,26 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     with: "$1.$2",
                     options: .regularExpression
                 )
-            return (text: normalized, box: line.box)
+            if let paired58 {
+                let range = NSRange(text.startIndex..<text.endIndex, in: text)
+                if let m = paired58.firstMatch(in: text, options: [], range: range),
+                   m.numberOfRanges >= 3,
+                   let g1 = Range(m.range(at: 1), in: text),
+                   let g2 = Range(m.range(at: 2), in: text)
+                {
+                    let v1 = String(text[g1]).replacingOccurrences(of: ",", with: ".")
+                    let v2 = String(text[g2]).replacingOccurrences(of: ",", with: ".")
+                    // Only rewrite when the two stripped values match —
+                    // that's the specific "same price twice" pattern
+                    // (SALE == REG on a non-discounted item). Different
+                    // values would mean a real discount and we can't
+                    // safely pick one over the other automatically.
+                    if v1 == v2 {
+                        text = "$" + v1
+                    }
+                }
+            }
+            return (text: text, box: line.box)
         }
     }
 
