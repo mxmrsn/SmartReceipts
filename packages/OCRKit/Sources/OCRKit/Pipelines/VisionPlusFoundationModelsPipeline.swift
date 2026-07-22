@@ -171,6 +171,10 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let session = LanguageModelSession(instructions: Self.instructions)
         let prompt = "Receipt OCR, pre-grouped into visual rows. Each row is prefixed with [R## y=YY] where YY is vertical position (0=top..99=bottom). Within a row, segments are separated by two spaces and are listed left-to-right; on a line-item row the rightmost segment is almost always the price.\n\n\(spatialOCR)\n\nReturn ONLY the JSON object."
 
+        if ProcessInfo.processInfo.environment["OCR_DEBUG_PROMPT"] != nil {
+            FileHandle.standardError.write(Data("=== FM PROMPT ===\n\(spatialOCR)\n=== END ===\n".utf8))
+        }
+
         // Apple's on-device FM has a fixed total context (input + output).
         // Reserving too much for output starves the input — the long
         // Safeway-style receipts then trigger "Exceeded model context
@@ -193,6 +197,9 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 "Foundation Models generation failed: \(error.localizedDescription)"
             )
         }
+        if ProcessInfo.processInfo.environment["OCR_DEBUG_FM"] != nil {
+            FileHandle.standardError.write(Data("=== FM RAW RESPONSE ===\n\(rawResponse)\n=== END ===\n".utf8))
+        }
         let extracted: ReceiptExtraction
         do {
             extracted = try Self.parseJSON(rawResponse)
@@ -213,6 +220,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // vanishes from recovery (IMG_1326 B&J at $6.49).
         // Apply the same fragment merge to the post-extraction lines
         // used by buildReceipt / column-anchored / bbox attachment.
+        //
+        // We intentionally do NOT drop metadata observations here — the
+        // column-anchored path needs the "Regular Price" / "Member
+        // Savings" label observations to identify which price observations
+        // are Safeway metadata (to skip them). Filtering the labels out
+        // would leave the metadata VALUES (3.99, 1.49-, etc.) unlabeled
+        // and column-anchored would pick them as if they were items.
         let postLines = Self.normalizePriceTokens(Self.mergeSplitPriceFragments(lines))
         var receipt = Self.buildReceipt(from: extracted, ocrLines: postLines)
         // PRIMARY line-item extraction: scan the price column directly.
@@ -1465,9 +1479,43 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
         guard pricePoints.count >= 2 else { return [] }
 
-        // Step 1b: price column = median X ± 5%.
+        // Step 1b: identify the price column.
+        //
+        // Median X works for most receipts, but Safeway-style chains that
+        // print BOTH a "Regular Price / Member Savings" metadata column
+        // AND a real paid-price column produce a bimodal X distribution
+        // (metadata at x≈0.58, actual prices at x≈0.66 on IMG_1788).
+        // With more metadata rows than real rows (2:1 ratio: each item
+        // has a regular-price + savings sibling), the median lands
+        // BETWEEN the columns and the ±0.05 band excludes the real
+        // prices entirely.
+        //
+        // Detect a bimodal X distribution by scanning sorted X values for
+        // a large gap. If found, prefer the RIGHTMOST cluster — actual
+        // paid prices always print rightmost on a receipt (regulars /
+        // savings values are indented to the left of the paid column).
         let xs = pricePoints.map(\.box.x).sorted()
-        let medianX = xs[xs.count / 2]
+        let medianX: Double = {
+            guard xs.count >= 4 else { return xs[xs.count / 2] }
+            var largestGap: Double = 0
+            var gapIdx = -1
+            for i in 1..<xs.count {
+                let g = xs[i] - xs[i - 1]
+                if g > largestGap { largestGap = g; gapIdx = i }
+            }
+            // A gap of 0.03+ is a real column boundary (thermal-printer
+            // columns are typically ≥ 0.06 apart in normalized coords).
+            if largestGap >= 0.03, gapIdx >= 0 {
+                let rightCluster = Array(xs[gapIdx..<xs.count])
+                // Only use the rightmost cluster if it's got enough
+                // members that it's plausibly the item column — otherwise
+                // a single stray X (rare) would hijack the pick.
+                if rightCluster.count >= 2 {
+                    return rightCluster[rightCluster.count / 2]
+                }
+            }
+            return xs[xs.count / 2]
+        }()
         let columnLo = max(0.0, medianX - 0.05)
         let columnHi = medianX + 0.05
 
@@ -1486,19 +1534,23 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
 
         // Step 4 (precompute): Y centers of every regular-price /
-        // member-savings / you-save label observation.
-        let labelPatterns: [String] = [
-            "regular price", "resular price", "reqular price",
-            "recular price", "repular price", "reaular price",
-            "member savings", "member saving",
-            "member savinas", "member savinos", "member savincs",
-            "for personalized", "forl personalized",
-            "you save", "you saved",
-        ]
+        // member-savings / you-save label observation. Fuzzy-matches
+        // against canonical phrases so OCR typos ("Reguler Price",
+        // "Member Sovings", "Menber Savings") still get flagged as
+        // labels — otherwise column-anchored ends up picking the
+        // metadata values as line items on faded Safeway receipts.
         let labelYs: [Double] = lines.compactMap { line in
             let lc = line.text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-            let isLabel = labelPatterns.contains { lc == $0 || lc.hasPrefix($0 + " ") }
-            return isLabel ? line.box.y + line.box.height / 2 : nil
+            guard !lc.isEmpty else { return nil }
+            if lc.count <= 30, fuzzyMatchesMetadata(lc) {
+                return line.box.y + line.box.height / 2
+            }
+            // Legacy shortcuts for phrases the fuzzy set doesn't cover.
+            let extras = ["for personalized", "forl personalized"]
+            if extras.contains(where: { lc == $0 || lc.hasPrefix($0 + " ") }) {
+                return line.box.y + line.box.height / 2
+            }
+            return nil
         }
 
         // Step 5–7: walk surviving prices in Y order.
@@ -3177,22 +3229,96 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             "grocery rewards", "rewards earned", "points earned",
             "loyalty discount",
         ]
+        let debug = ProcessInfo.processInfo.environment["OCR_DEBUG_META"] != nil
         return lines.filter { line in
             let lc = line.text
                 .lowercased()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !lc.isEmpty else { return false }
             for pat in metadataLinePatterns {
-                if lc == pat { return false }
-                if lc.hasPrefix(pat + " ") { return false }
-                if lc.hasPrefix(pat + ":") { return false }
-                if lc.hasPrefix(pat + "-") { return false }
+                if lc == pat {
+                    if debug { FileHandle.standardError.write(Data("DROP eq: |\(line.text)|\n".utf8)) }
+                    return false
+                }
+                if lc.hasPrefix(pat + " ") || lc.hasPrefix(pat + ":") || lc.hasPrefix(pat + "-") {
+                    if debug { FileHandle.standardError.write(Data("DROP prefix: |\(line.text)|\n".utf8)) }
+                    return false
+                }
             }
             if dropIfContains.contains(where: { lc.contains($0) }) {
+                if debug { FileHandle.standardError.write(Data("DROP contains: |\(line.text)|\n".utf8)) }
                 return false
+            }
+            // Fuzzy fallback. The explicit typo list catches the specific
+            // OCR misreads we've seen ("resular price", "member savincs")
+            // but not every possible one — Safeway thermal-fade produces
+            // "Member Sovings" ("a"→"o"), "Menber Savings" ("m"→"n"),
+            // "Reguler Price" ("a"→"e"), and endless friends. Reject any
+            // line within edit distance 2 of a canonical metadata phrase.
+            // We only apply this when the line is short (≤ 30 chars) and
+            // the length is close to the phrase (guardrail against
+            // matching a long real product name).
+            if lc.count <= 30, fuzzyMatchesMetadata(lc) {
+                if debug { FileHandle.standardError.write(Data("DROP fuzzy: |\(line.text)|\n".utf8)) }
+                return false
+            }
+            if debug && (lc.contains("price") || lc.contains("sav")) {
+                FileHandle.standardError.write(Data("KEEP: |\(line.text)| lc=|\(lc)| bytes=\(Array(lc.utf8))\n".utf8))
             }
             return true
         }
+    }
+
+    /// Canonical metadata phrases used by the fuzzy check. We accept ≤ 2
+    /// character edits between the OCR text and any of these, provided
+    /// the two lengths are within 2 of each other (otherwise a long real
+    /// product name could match by prefix).
+    private static let fuzzyMetadataPhrases: [String] = [
+        "regular price",
+        "member savings",
+        "member saving",
+        "membership savings",
+        "manufacturer coupon",
+        "store coupon",
+        "you saved",
+        "you save",
+        "grocery rewards",
+        "rewards earned",
+        "loyalty discount",
+        "sale price",
+        "reg price",
+    ]
+
+    private static func fuzzyMatchesMetadata(_ lc: String) -> Bool {
+        for phrase in fuzzyMetadataPhrases {
+            if abs(lc.count - phrase.count) > 2 { continue }
+            if levenshteinDistance(lc, phrase) <= 2 { return true }
+        }
+        return false
+    }
+
+    /// Iterative Levenshtein — small strings (< 32 chars) so allocation
+    /// cost is negligible compared to the Vision + FM latency.
+    private static func levenshteinDistance(_ a: String, _ b: String) -> Int {
+        let s1 = Array(a)
+        let s2 = Array(b)
+        if s1.isEmpty { return s2.count }
+        if s2.isEmpty { return s1.count }
+        var prev = Array(0...s2.count)
+        var curr = Array(repeating: 0, count: s2.count + 1)
+        for i in 1...s1.count {
+            curr[0] = i
+            for j in 1...s2.count {
+                let cost = s1[i - 1] == s2[j - 1] ? 0 : 1
+                curr[j] = min(
+                    curr[j - 1] + 1,        // insertion
+                    prev[j] + 1,            // deletion
+                    prev[j - 1] + cost      // substitution
+                )
+            }
+            swap(&prev, &curr)
+        }
+        return prev[s2.count]
     }
 
     /// When a row's *only* content is a price-shaped token (e.g. "$11.75")
