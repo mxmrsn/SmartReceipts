@@ -257,6 +257,21 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         receipt.lineItems.removeAll { item in
             Self.looksLikeNonItemRecoveryCandidate(item.description)
         }
+        // Implausible-price filter: drop items whose price exceeds
+        // 3× the receipt total. On Ace Hardware IMG_4359, FM emitted
+        // "CALCOAST DUMP SKU $821.99" — that's a SKU/serial number
+        // Vision concatenated onto the description text, then FM
+        // treated as the price. Column-anchored already filters
+        // price > total on its path, but FM's items survive when
+        // column extraction produces zero items and we fall through
+        // to the FM output. The × 3 threshold keeps legit cases
+        // where a big item is offset by a credit/refund (IMG_4161:
+        // $34.99 CARBONATOR with a −$15.50 credit and a $21.41 total
+        // stays at ratio 1.63, well under 3×).
+        if receipt.totals.total > 0 {
+            let priceCeiling = receipt.totals.total * Decimal(3)
+            receipt.lineItems.removeAll { $0.totalPrice > priceCeiling }
+        }
         // Backfill bboxes by matching extracted field values back to OCR lines.
         // The bbox overlay in the labeler uses these to highlight detections.
         // Uses the normalized lines so a price like "6. 49 S" still matches
