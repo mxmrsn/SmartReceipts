@@ -52,11 +52,21 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
 
         let observations: [VNRecognizedTextObservation] = request.results ?? []
-        let lines: [(text: String, box: Receipt.BBox)] = observations
+        let rawLines: [(text: String, box: Receipt.BBox)] = observations
             .compactMap { obs -> (text: String, box: Receipt.BBox)? in
                 guard let top = obs.topCandidates(1).first else { return nil }
                 return (text: top.string, box: Self.bbox(from: obs.boundingBox))
             }
+        // Correct for a receipt captured 90° rotated (missing / wrong
+        // EXIF, or a screenshot of a landscape phone photo). Vision
+        // recognizes the characters fine either way, but the bounding
+        // boxes are in image coordinates and if the receipt was on its
+        // side then every "text line" observation is TALL and NARROW
+        // and all lines collapse into a single narrow Y band. Column-
+        // anchored extraction can't work without a vertical price
+        // column, so we detect this case and rotate the observations
+        // back into a portrait-oriented coordinate system.
+        let lines = Self.correctRotatedObservations(rawLines)
             .sorted { $0.box.y < $1.box.y }
         let rawText = lines.map(\.text).joined(separator: "\n")
 
@@ -2117,6 +2127,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     fileprivate static func looksLikeNonItemRecoveryCandidate(_ description: String) -> Bool {
         let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
         let lc = trimmed.lowercased()
+        // Also strip leading/trailing punctuation and collapse whitespace
+        // for the fragment check: "**** BALANCE" should match "balance",
+        // "..TAX.." should match "tax", etc.
+        let stripped = lc
+            .replacingOccurrences(of: #"[^a-z0-9 ]"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #" +"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
 
         // Common department headers — these print on their own row and
         // get picked up if a price observation lands in the same band.
@@ -2141,7 +2158,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // column area at random Ys and confuse recovery.
             "vol", "vol+", "vol-", "wt", "info",
         ]
-        if metadataFragments.contains(lc) { return true }
+        if metadataFragments.contains(lc) || metadataFragments.contains(stripped) { return true }
 
         // Multi-word footer phrases.
         let footerPhrases: [String] = [
@@ -2730,6 +2747,133 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             .replacingOccurrences(of: ",", with: "")
         guard !cleaned.isEmpty else { return nil }
         return Decimal(string: cleaned, locale: Locale(identifier: "en_US_POSIX"))
+    }
+
+    /// Detect the "receipt captured 90° rotated" case and rotate the
+    /// Vision observation coordinates back into portrait orientation.
+    /// Every observation's text was recognized correctly by Vision
+    /// (per-observation orientation is Vision's job), but the bboxes
+    /// are in image coordinates and if the receipt was on its side
+    /// then all "text lines" are tall/narrow observations that
+    /// collapse into a single narrow Y band. Column-anchored
+    /// extraction can't work without a vertical price column.
+    ///
+    /// Detection uses the aspect-ratio signature (width/height ratio
+    /// of each observation): normal-orientation text lines are much
+    /// wider than tall (typical 5–8×), but text on a 90°-rotated
+    /// image lands in a bounding box that's much TALLER than wide
+    /// (aspect < 0.5). If ≥ 70% of observations have h > w we're
+    /// almost certainly looking at a rotated capture.
+    ///
+    /// Direction (CW vs CCW) is decided by trying both transforms
+    /// and picking the one that produces a larger Y-span (portrait
+    /// content spans the full Y axis).
+    fileprivate static func correctRotatedObservations(
+        _ lines: [(text: String, box: Receipt.BBox)]
+    ) -> [(text: String, box: Receipt.BBox)] {
+        guard lines.count >= 8 else { return lines }
+        var tallCount = 0
+        for l in lines {
+            if l.box.height > l.box.width { tallCount += 1 }
+        }
+        let tallFraction = Double(tallCount) / Double(lines.count)
+        guard tallFraction >= 0.70 else { return lines }
+
+        // Two possible rotations to un-rotate the observations. Under a
+        // 90° CW rotation of coordinates around image center:
+        //     (x, y, w, h) → (1 - y - h, x, h, w)
+        // Under a 90° CCW rotation:
+        //     (x, y, w, h) → (y, 1 - x - w, h, w)
+        func rotateCW(_ b: Receipt.BBox) -> Receipt.BBox {
+            Receipt.BBox(
+                x: max(0, 1 - b.y - b.height),
+                y: b.x,
+                width: b.height,
+                height: b.width
+            )
+        }
+        func rotateCCW(_ b: Receipt.BBox) -> Receipt.BBox {
+            Receipt.BBox(
+                x: b.y,
+                y: max(0, 1 - b.x - b.width),
+                width: b.height,
+                height: b.width
+            )
+        }
+
+        let cw = lines.map { (text: $0.text, box: rotateCW($0.box)) }
+        let ccw = lines.map { (text: $0.text, box: rotateCCW($0.box)) }
+
+        // Both rotations produce the same Y-span (rotating the whole
+        // set doesn't change its Y-range), so we can't pick based on
+        // range alone. But we CAN pick based on where content-header
+        // signals end up. The store name / masthead is typically the
+        // first meaningful text on a receipt and should land near the
+        // TOP after correction. Vision returns observations sorted by
+        // Y (already-sorted assumption for the pre-rotation set), so
+        // the first few observations correspond to the top of the
+        // physical receipt. Whichever rotation puts those at the top
+        // of the new coordinate system wins.
+        func earlyContentYMean(_ rotated: [(text: String, box: Receipt.BBox)]) -> Double {
+            // The rotation transform doesn't change observation ORDER
+            // in the input list; the input list order came from Vision
+            // and is roughly top-to-bottom in ORIGINAL image coords.
+            // For a receipt rotated 90° in the image, the "original
+            // top-to-bottom" order is actually left-to-right of the
+            // receipt content — so `rotated[0]` is likely a corner
+            // observation. Instead, pick observations by content:
+            // header/store text is usually longer than 4 chars and
+            // uppercase-heavy. Fall back to the first 20% of items
+            // sorted by post-rotation Y.
+            let sortedByY = rotated.sorted { $0.box.y < $1.box.y }
+            let head = sortedByY.prefix(max(3, rotated.count / 5))
+            guard !head.isEmpty else { return 0.5 }
+            let ys = head.map { $0.box.y + $0.box.height / 2 }
+            return ys.reduce(0, +) / Double(ys.count)
+        }
+
+        // Prefer the rotation that puts the "top block" of content
+        // closer to Y=0. Both have identical *distributions*, but
+        // the actual observation-to-Y assignment differs.
+        let cwHeaderY = earlyContentYMean(cw)
+        let ccwHeaderY = earlyContentYMean(ccw)
+
+        // The heuristic above is weak; strengthen with a merchant-
+        // header check. Common brand or store words that appear at
+        // the top of most receipts.
+        let brandHints: Set<String> = [
+            "safeway", "trader joe", "walmart", "target", "costco",
+            "sprouts", "philz", "mobil", "ulta", "chipotle", "starbucks",
+            "amazon", "receipt", "welcome", "thank you",
+        ]
+        func brandY(_ rotated: [(text: String, box: Receipt.BBox)]) -> Double? {
+            var ys: [Double] = []
+            for l in rotated {
+                let lc = l.text.lowercased()
+                if brandHints.contains(where: { lc.contains($0) }) {
+                    ys.append(l.box.y + l.box.height / 2)
+                }
+            }
+            guard !ys.isEmpty else { return nil }
+            return ys.min()
+        }
+        let cwBrandY = brandY(cw)
+        let ccwBrandY = brandY(ccw)
+
+        // Pick: brand-anchored preference beats the header-mean
+        // heuristic when available.
+        let chosen: [(text: String, box: Receipt.BBox)]
+        switch (cwBrandY, ccwBrandY) {
+        case (let a?, let b?):
+            chosen = a <= b ? cw : ccw
+        case (_?, nil):
+            chosen = cw
+        case (nil, _?):
+            chosen = ccw
+        case (nil, nil):
+            chosen = cwHeaderY <= ccwHeaderY ? cw : ccw
+        }
+        return chosen
     }
 
     private static func bbox(from vn: CGRect) -> Receipt.BBox {
