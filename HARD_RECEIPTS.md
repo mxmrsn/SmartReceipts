@@ -1,26 +1,19 @@
 # Hard-to-parse receipts
 
-## Current state (2026-07-22, after slip-above + forced-dewarp round)
+## Current state (2026-07-22, after savings-total-circle round)
 
-1,183/1,183 extract. **843 high (≥ 0.85) · 222 medium · 115 low.**
-Avg confidence 0.865. The dashboard's trust gate (CONF_FLOOR 0.6)
-excludes the 115 low-confidence receipts from every chart and trend
-— they surface only in Recent Receipts with red pills. The
-escalation ladder is standard → tiled 2× re-scan → forced dewarp;
-allow ~8 min/receipt worst-case when re-extracting (extractor
-timeout raised to 480 s after 3 receipts hit the old 240 s cap).
+1,183/1,183 extract. **861 high (>= 0.85) - 224 medium - 98 low.**
+Avg confidence 0.875. Dashboard: 1,083 of 1,179 receipts in trends,
+96 excluded by the trust gate, trusted spend $48,139.47.
 
-Remaining 115: thermal fade / crumples with unrecoverable text,
-plus assorted one-offs (IMG_8572 candy-deal pricing, IMG_4084).
+The savings-total vicious circle is fixed (bogus $1.00 totals no
+longer nuke the item column via the price ceiling); cut-off photos
+with self-consistent totals now score fairly. The remaining 98 are
+the honest floor: faded thermal / crumpled paper where OCR produces
+no usable price text, USPS/money-order formats, salon slips, and a
+handful of deal-pricing one-offs. Day's arc: avg 0.73 -> 0.875,
+high count 617 -> 861, low tail 343 -> 98.
 
-Living TODO list of receipts that don't yet extract cleanly. Cross out
-(`~~IMG_XXXX~~`) as they're resolved. When a whole failure mode is
-retired, remove the section.
-
-Confidence bands referenced below map to `receipt.provenance.confidence`:
-- **high** ≥ 0.85 (dashboard shows green)
-- **medium** 0.60–0.85 (yellow)
-- **low** < 0.60 (red — worth investigating)
 
 ## In active development
 
