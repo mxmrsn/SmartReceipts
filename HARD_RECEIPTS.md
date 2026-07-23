@@ -88,6 +88,25 @@ Only 1 item extracted from a receipt with several. Layout unknown yet.
 - IMG_1741 Walgreens (conf 0.10)
 - IMG_2171 Madewell (conf 0.10)
 
+## Residual after the tiled hi-res re-scan round (2026-07-22, latest)
+
+The escalation path (conf < 0.6 → 3-band 2×-upscaled re-OCR → full
+pipeline re-run → keep the higher score) rescued **121 of 296**
+low-confidence receipts. Distribution now: **801 high (≥ 0.85)**,
+207 medium, 175 low. Avg confidence 0.839.
+
+Remaining 175 low-confidence receipts are the true hard core:
+- under-half (55) + under (69) — text genuinely absent or illegible
+  (thermal fade, crumples, fold shadows). 2× resolution didn't
+  produce the missing observations either.
+- over (27) + doubled (6) — mostly folded-receipt geometry where two
+  physical column bands interleave (IMG_5085 class).
+- close-low (12) — near-balanced sums with missing dates/merchants.
+
+Next levers, roughly in value order: fold-aware column splitting for
+the over/doubled class; EXIF-date fallback for undated receipts;
+contrast enhancement (CLAHE-style) before OCR for thermal fade.
+
 ## Residual after the item-extraction round (2026-07-22, later)
 
 Confidence distribution across all 1,183: **728 high (≥ 0.85)**,
