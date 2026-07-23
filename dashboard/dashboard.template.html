@@ -331,8 +331,8 @@
           <table id="mdItems">
             <thead><tr>
               <th>Item <span class="helper">click to chart</span></th>
-              <th class="num">Bought</th>
-              <th class="num">Avg</th>
+              <th class="num">Units</th>
+              <th class="num">$/Unit</th>
               <th class="num">Spend</th>
             </tr></thead>
             <tbody></tbody>
@@ -348,7 +348,7 @@
   </div>
 
   <div class="panel c-8">
-    <h3>Repeat Product <span class="helper">price over time</span>
+    <h3>Repeat Product <span class="helper">unit price over time</span>
       <select id="productPicker" style="margin-left:14px"></select>
     </h3>
     <svg id="chartProduct" viewBox="0 0 800 220" preserveAspectRatio="none"></svg>
@@ -607,8 +607,12 @@ function merchantItemIndex(merchant) {
       if (!key) continue;
       if (Math.abs(it.price) < 0.5) continue;
       if (NOISE_PATTERNS.some(rx => rx.test(key))) continue;
-      if (!idx.has(key)) idx.set(key, {label: titleCase(key), entries: []});
-      idx.get(key).entries.push({date: r.date, price: it.price, merchant});
+      if (!idx.has(key)) idx.set(key, {label: titleCase(key), entries: [], spend: 0, units: 0});
+      const u = unitPrice(it);
+      const rec = idx.get(key);
+      rec.entries.push({date: r.date, price: u.unit, merchant});
+      rec.spend += it.price;   // spend stays the LINE total (what you paid)
+      rec.units += u.units;
     }
   }
   return [...idx.entries()]
@@ -617,7 +621,8 @@ function merchantItemIndex(merchant) {
       label: v.label,
       entries: v.entries,
       count: v.entries.length,
-      spend: v.entries.reduce((s, e) => s + e.price, 0),
+      units: v.units,
+      spend: v.spend,
     }))
     .sort((a, b) => b.count - a.count || b.spend - a.spend)
     .slice(0, 15);
@@ -655,8 +660,8 @@ function selectMerchant(name) {
       tr.dataset.key = it.key;
       tr.innerHTML = `
         <td>${it.label.slice(0, 42)}</td>
-        <td class="num dim">${it.count}×</td>
-        <td class="num dim">${fmtMoney(it.spend / it.count)}</td>
+        <td class="num dim">${fmtUnits(it.units)}</td>
+        <td class="num dim">${fmtMoney(it.spend / (it.units || 1))}</td>
         <td class="num">${fmtMoney(it.spend)}</td>`;
       tr.addEventListener('click', () => selectMerchantItem(name, it, tr));
       tbody.appendChild(tr);
@@ -673,7 +678,7 @@ function selectMerchantItem(merchant, item, rowEl) {
   document.querySelectorAll('#mdItems tbody tr').forEach(tr => tr.classList.remove('selected'));
   if (rowEl) rowEl.classList.add('selected');
   document.getElementById('mdChartTitle').textContent =
-    `${item.label} — price over time at ${merchant}`;
+    `${item.label} — unit price over time at ${merchant}`;
   drawPriceTimeChart(
     document.getElementById('mdChart'),
     document.getElementById('mdChartMeta'),
@@ -731,9 +736,10 @@ function buildProductIndex() {
       if (Math.abs(it.price) < 0.75) continue;   // skip tiny bottle fees
       if (NOISE_PATTERNS.some(rx => rx.test(key))) continue;
       if (!idx.has(key)) idx.set(key, []);
+      const u = unitPrice(it);
       idx.get(key).push({
         date: r.date,
-        price: it.price,
+        price: u.unit,
         merchant: r.merchant,
         receipt: r.file,
       });
@@ -754,6 +760,24 @@ function normalizeDesc(desc) {
     .replace(/[^a-z0-9 ]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+// True unit price: line total ÷ quantity. Quantity may be a count
+// (2 @ $1.29) or a weight (2.48 lb of bananas) — either way the
+// division yields the honest per-unit / per-lb price, which is what
+// a price-trend chart should show. Guards: implausible quantities
+// (0, negative, > 99) and sub-cent results fall back to the line
+// total treated as a single unit.
+function unitPrice(it) {
+  const q = it.qty;
+  if (!q || q <= 0 || q > 99) return {unit: it.price, units: 1};
+  const u = it.price / q;
+  if (Math.abs(u) < 0.01) return {unit: it.price, units: 1};
+  return {unit: u, units: q};
+}
+
+function fmtUnits(u) {
+  return Number.isInteger(u) ? String(u) : u.toFixed(1);
 }
 
 function renderProductPicker() {
@@ -839,7 +863,7 @@ function drawPriceTimeChart(svg, metaEl, points, H) {
 
   const avg = prices.reduce((s, p) => s + p, 0) / prices.length;
   const merchants = new Set(sorted.map(x => x.merchant));
-  metaEl.textContent = `${sorted.length} purchases · avg ${fmtMoney(avg)} · ${merchants.size} merchant(s) · range ${fmtMoney(Math.min(...prices))} – ${fmtMoney(Math.max(...prices))}`;
+  metaEl.textContent = `${sorted.length} purchases · avg unit ${fmtMoney(avg)} · ${merchants.size} merchant(s) · unit range ${fmtMoney(Math.min(...prices))} – ${fmtMoney(Math.max(...prices))}`;
 }
 
 function renderProduct(key, repeats) {
