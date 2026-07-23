@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import Foundation
 import ImageIO
 import Vision
@@ -50,12 +51,68 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let prep = ReceiptImagePreprocessor.preprocess(image: image, orientation: orientation)
 
         // ---- 1) Vision OCR ----
+        // NOTE: bboxes are in the CORRECTED image's coord space (not the
+        // original photo's) when preprocessing fired. This is deliberate —
+        // the rest of the pipeline (column-anchored price extraction, row
+        // clustering, etc.) needs prices to be aligned in a vertical
+        // column, which is what the corrected image guarantees. The
+        // `prep.mapBBoxToOriginal` mapper is available for callers that
+        // need to draw bboxes on the ORIGINAL image.
+        let lines = try Self.recognizeLines(image: prep.image, orientation: prep.orientation)
+        guard !lines.isEmpty else {
+            throw OCRError.parseFailed("Vision returned no recognized text.")
+        }
+
+        // ---- 2) Foundation Models structured extraction ----
+        guard case .available = SystemLanguageModel.default.availability else {
+            throw OCRError.modelNotAvailable(
+                "Apple Foundation Models unavailable. Enable Apple Intelligence in System Settings."
+            )
+        }
+
+        var receipt = try await Self.extractReceipt(from: lines)
+        var usedLines = lines
+
+        // ---- 2b) Escalation: tiled hi-res re-scan ----
+        // Vision silently drops small text (price cents are the first
+        // casualty) when the receipt's glyphs are few pixels tall in the
+        // frame. When the standard pass lands below the low-confidence
+        // band, re-OCR the receipt as overlapping horizontal bands
+        // upscaled 2× — text twice as tall recovers observations the
+        // full-frame pass never produced — then run the whole pipeline
+        // again and keep whichever result scores higher. Cost is a
+        // second Vision + FM round on only the receipts that need it.
+        if receipt.provenance.confidence < 0.6,
+           let tiled = Self.recognizeLinesTiled(image: prep.image, orientation: prep.orientation),
+           !tiled.isEmpty,
+           let retry = try? await Self.extractReceipt(from: tiled),
+           retry.provenance.confidence > receipt.provenance.confidence {
+            receipt = retry
+            usedLines = tiled
+        }
+
+        let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
+        return ExtractionResult(
+            receipt: receipt,
+            latencyMs: elapsedMs,
+            peakMemoryMB: nil,
+            rawText: usedLines.map(\.text).joined(separator: "\n"),
+            ocrLines: usedLines.map { OCRLine(text: $0.text, box: $0.box) }
+        )
+    }
+
+    /// Standard single-pass Vision OCR: recognize, correct 90°-rotated
+    /// observation geometry, sort top-to-bottom.
+    private static func recognizeLines(
+        image: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) throws -> [(text: String, box: Receipt.BBox)] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         request.recognitionLanguages = ["en-US"]
 
-        let handler = VNImageRequestHandler(cgImage: prep.image, orientation: prep.orientation, options: [:])
+        let handler = VNImageRequestHandler(cgImage: image, orientation: orientation, options: [:])
         do {
             try handler.perform([request])
         } catch {
@@ -68,15 +125,6 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 guard let top = obs.topCandidates(1).first else { return nil }
                 return (text: top.string, box: Self.bbox(from: obs.boundingBox))
             }
-        // NOTE: bboxes returned in `rawLines` are in the CORRECTED image's
-        // coord space (not the original photo's). This is deliberate — the
-        // rest of the pipeline (column-anchored price extraction, row
-        // clustering, etc.) needs prices to be aligned in a vertical
-        // column, which is what the corrected image guarantees. The
-        // `prep.mapBBoxToOriginal` mapper is available for callers that
-        // need to draw bboxes on the ORIGINAL image; the labeler will
-        // eventually consume it.
-        _ = prep.mapBBoxToOriginal
         // Correct for a receipt captured 90° rotated (missing / wrong
         // EXIF, or a screenshot of a landscape phone photo). Vision
         // recognizes the characters fine either way, but the bounding
@@ -86,21 +134,128 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // anchored extraction can't work without a vertical price
         // column, so we detect this case and rotate the observations
         // back into a portrait-oriented coordinate system.
-        let lines = Self.correctRotatedObservations(rawLines)
+        return Self.correctRotatedObservations(rawLines)
             .sorted { $0.box.y < $1.box.y }
-        let rawText = lines.map(\.text).joined(separator: "\n")
+    }
 
-        guard !rawText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw OCRError.parseFailed("Vision returned no recognized text.")
-        }
+    /// Tiled hi-res OCR: orient the image upright, slice it into
+    /// overlapping horizontal bands, upscale each band 2×, OCR each
+    /// band independently, then merge observations back into full-image
+    /// normalized coordinates (deduping the overlap zones).
+    ///
+    /// Why this recovers text the standard pass drops: Vision
+    /// downsamples large inputs internally, and a tall receipt photo
+    /// leaves each glyph only a handful of pixels — price cents are the
+    /// first thing it silently discards ("$8.42" comes back as "$8" or
+    /// nothing). A 2×-upscaled third of the image keeps the pixel count
+    /// manageable while doubling glyph height.
+    private static func recognizeLinesTiled(
+        image: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> [(text: String, box: Receipt.BBox)]? {
+        guard let upright = uprightCGImage(image, orientation: orientation) else { return nil }
+        let W = upright.width
+        let H = upright.height
+        guard W > 0, H > 0 else { return nil }
 
-        // ---- 2) Foundation Models structured extraction ----
-        guard case .available = SystemLanguageModel.default.availability else {
-            throw OCRError.modelNotAvailable(
-                "Apple Foundation Models unavailable. Enable Apple Intelligence in System Settings."
+        let bands = 3
+        let overlap = 0.08   // fraction of full height shared between bands
+
+        var merged: [(text: String, box: Receipt.BBox)] = []
+        for i in 0..<bands {
+            let y0 = max(0.0, Double(i) / Double(bands) - overlap / 2)
+            let y1 = min(1.0, Double(i + 1) / Double(bands) + overlap / 2)
+            let bandFrac = y1 - y0
+            let cropRect = CGRect(
+                x: 0, y: (y0 * Double(H)).rounded(.down),
+                width: Double(W), height: (bandFrac * Double(H)).rounded(.up)
             )
+            guard let tile = upright.cropping(to: cropRect) else { continue }
+            // Upscale 2× unless the band is already huge (at that point
+            // resolution isn't the limiting factor and doubling would
+            // just burn memory).
+            let scaled: CGImage = tile.width * 2 <= 9000
+                ? (upscaled(tile, factor: 2) ?? tile)
+                : tile
+
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            request.recognitionLanguages = ["en-US"]
+            let handler = VNImageRequestHandler(cgImage: scaled, orientation: .up, options: [:])
+            guard (try? handler.perform([request])) != nil else { continue }
+
+            for obs in request.results ?? [] {
+                guard let top = obs.topCandidates(1).first else { continue }
+                let bb = obs.boundingBox   // tile space, origin bottom-left
+                // Convert to full-image normalized top-left coords.
+                let tileTopY = 1.0 - bb.origin.y - bb.height
+                let box = Receipt.BBox(
+                    x: bb.origin.x,
+                    y: y0 + tileTopY * bandFrac,
+                    width: bb.width,
+                    height: bb.height * bandFrac
+                )
+                merged.append((text: top.string, box: box))
+            }
+        }
+        guard !merged.isEmpty else { return nil }
+
+        // Dedupe the overlap zones: the same printed line OCR'd by two
+        // adjacent bands produces near-identical text at near-identical
+        // position. Keep the first occurrence.
+        var kept: [(text: String, box: Receipt.BBox)] = []
+        for obs in merged.sorted(by: { $0.box.y < $1.box.y }) {
+            let cy = obs.box.y + obs.box.height / 2
+            let isDupe = kept.contains { k in
+                let kcy = k.box.y + k.box.height / 2
+                return abs(kcy - cy) < 0.006
+                    && abs(k.box.x - obs.box.x) < 0.02
+                    && k.text.trimmingCharacters(in: .whitespaces)
+                        == obs.text.trimmingCharacters(in: .whitespaces)
+            }
+            if !isDupe { kept.append(obs) }
         }
 
+        return Self.correctRotatedObservations(kept)
+            .sorted { $0.box.y < $1.box.y }
+    }
+
+    /// Render the image with its EXIF orientation applied so tiling
+    /// bands align with printed text rows.
+    private static func uprightCGImage(
+        _ image: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> CGImage? {
+        guard orientation != .up else { return image }
+        let ci = CIImage(cgImage: image).oriented(forExifOrientation: Int32(orientation.rawValue))
+        let ctx = CIContext(options: nil)
+        return ctx.createCGImage(ci, from: ci.extent)
+    }
+
+    /// Integer-factor bicubic upscale via CGContext.
+    private static func upscaled(_ image: CGImage, factor: Int) -> CGImage? {
+        let w = image.width * factor
+        let h = image.height * factor
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: 0,
+            space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage()
+    }
+
+    /// The full post-OCR pipeline: FM structured extraction plus every
+    /// sanity / repair / reconciliation pass, ending with the receipt-
+    /// level confidence score. Factored out of `extract` so the tiled
+    /// hi-res escalation can run the identical pipeline on a second OCR
+    /// line set and compare confidence scores.
+    private static func extractReceipt(
+        from lines: [(text: String, box: Receipt.BBox)]
+    ) async throws -> Receipt {
         // Pre-cluster Vision observations into visual rows so a description
         // and its price on the same printed line arrive at the model as a
         // single row, separated by "  ". Massively reduces the
@@ -263,8 +418,6 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 "Could not parse model output as JSON: \(error.localizedDescription). Raw output: \(rawResponse.prefix(400))"
             )
         }
-
-        let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
 
         // ---- 3) Build canonical Receipt ----
         // Use the price-normalized lines for all post-extraction work
@@ -441,13 +594,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // filter or highlight low-confidence extractions.
         receipt.provenance.confidence = Self.computeReceiptConfidence(receipt)
 
-        return ExtractionResult(
-            receipt: receipt,
-            latencyMs: elapsedMs,
-            peakMemoryMB: nil,
-            rawText: rawText,
-            ocrLines: lines.map { OCRLine(text: $0.text, box: $0.box) }
-        )
+        return receipt
     }
 
     // MARK: - Date validation + recovery
