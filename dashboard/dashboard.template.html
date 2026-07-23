@@ -181,6 +181,13 @@
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: var(--hover); }
   td.dim { color: var(--text-dim); }
+  tr.clickable { cursor: pointer; }
+  tr.selected td {
+    background: rgba(122, 165, 255, 0.08);
+  }
+  tr.selected td:first-child {
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
   .scrollable {
     max-height: 380px;
     overflow-y: auto;
@@ -285,7 +292,7 @@
   </div>
 
   <div class="panel c-6">
-    <h3>Top Merchants <span class="helper">by spend</span></h3>
+    <h3>Top Merchants <span class="helper">click a row for detail</span></h3>
     <div class="scrollable">
       <table id="tableMerchants">
         <thead><tr>
@@ -310,6 +317,33 @@
         </tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+  </div>
+
+  <div class="panel c-12" id="merchantDetail" style="display:none">
+    <h3><span id="mdName">Merchant</span>
+      <span class="helper" id="mdStats"></span>
+      <button id="mdClose" style="float:right;background:transparent;border:0;color:var(--text-dim);cursor:pointer;font:inherit;">✕ close</button>
+    </h3>
+    <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:8px;">
+      <div style="flex:1;min-width:300px;">
+        <div class="scrollable" style="max-height:300px;">
+          <table id="mdItems">
+            <thead><tr>
+              <th>Item <span class="helper">click to chart</span></th>
+              <th class="num">Bought</th>
+              <th class="num">Avg</th>
+              <th class="num">Spend</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+      <div style="flex:1.4;min-width:360px;">
+        <div style="color:var(--text-dim);font-size:12px;margin-bottom:6px;" id="mdChartTitle"></div>
+        <svg id="mdChart" viewBox="0 0 800 240" preserveAspectRatio="none"></svg>
+        <div id="mdChartMeta" style="color:var(--text-dim);font-size:12px;margin-top:8px;"></div>
+      </div>
     </div>
   </div>
 
@@ -530,7 +564,9 @@ function renderSector() {
   }
 }
 
-// Merchant table.
+// Merchant table (rows clickable → detail panel below).
+let selectedMerchant = null;
+
 function renderMerchants() {
   const tbody = document.querySelector('#tableMerchants tbody');
   tbody.innerHTML = '';
@@ -547,15 +583,110 @@ function renderMerchants() {
     .slice(0, 40);
 
   for (const row of rows) {
-    tbody.insertAdjacentHTML('beforeend', `<tr>
+    const tr = document.createElement('tr');
+    tr.className = 'clickable' + (row.name === selectedMerchant ? ' selected' : '');
+    tr.dataset.merchant = row.name;
+    tr.innerHTML = `
       <td>${row.name}</td>
       <td class="num">${fmtMoney(row.spend)}</td>
       <td class="num dim">${fmtInt(row.visits)}</td>
-      <td class="num dim">${fmtMoney(row.avg)}</td>
-    </tr>`);
+      <td class="num dim">${fmtMoney(row.avg)}</td>`;
+    tr.addEventListener('click', () => selectMerchant(row.name));
+    tbody.appendChild(tr);
   }
   if (!rows.length) tbody.innerHTML = '<tr><td colspan="4" class="empty">No merchants yet.</td></tr>';
 }
+
+// ----- Merchant detail: top purchased items + per-item price history -----
+function merchantItemIndex(merchant) {
+  const idx = new Map(); // normalized desc → {label, entries: [{date, price, merchant}]}
+  for (const r of data) {
+    if (r.merchant !== merchant || !r.date) continue;
+    for (const it of r.items) {
+      const key = normalizeDesc(it.desc);
+      if (!key) continue;
+      if (Math.abs(it.price) < 0.5) continue;
+      if (NOISE_PATTERNS.some(rx => rx.test(key))) continue;
+      if (!idx.has(key)) idx.set(key, {label: titleCase(key), entries: []});
+      idx.get(key).entries.push({date: r.date, price: it.price, merchant});
+    }
+  }
+  return [...idx.entries()]
+    .map(([key, v]) => ({
+      key,
+      label: v.label,
+      entries: v.entries,
+      count: v.entries.length,
+      spend: v.entries.reduce((s, e) => s + e.price, 0),
+    }))
+    .sort((a, b) => b.count - a.count || b.spend - a.spend)
+    .slice(0, 15);
+}
+
+function selectMerchant(name) {
+  const panel = document.getElementById('merchantDetail');
+  if (selectedMerchant === name) {   // toggle off
+    selectedMerchant = null;
+    panel.style.display = 'none';
+    renderMerchants();
+    return;
+  }
+  selectedMerchant = name;
+  renderMerchants();
+
+  const visits = data.filter(r => r.merchant === name);
+  const spend = visits.reduce((s, r) => s + r.total, 0);
+  document.getElementById('mdName').textContent = name;
+  document.getElementById('mdStats').textContent =
+    `${visits.length} visits · ${fmtMoney(spend)} total`;
+
+  const items = merchantItemIndex(name);
+  const tbody = document.querySelector('#mdItems tbody');
+  tbody.innerHTML = '';
+  if (!items.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No repeat items extracted for this merchant.</td></tr>';
+    document.getElementById('mdChart').innerHTML = '';
+    document.getElementById('mdChartTitle').textContent = '';
+    document.getElementById('mdChartMeta').textContent = '';
+  } else {
+    for (const it of items) {
+      const tr = document.createElement('tr');
+      tr.className = 'clickable';
+      tr.dataset.key = it.key;
+      tr.innerHTML = `
+        <td>${it.label.slice(0, 42)}</td>
+        <td class="num dim">${it.count}×</td>
+        <td class="num dim">${fmtMoney(it.spend / it.count)}</td>
+        <td class="num">${fmtMoney(it.spend)}</td>`;
+      tr.addEventListener('click', () => selectMerchantItem(name, it, tr));
+      tbody.appendChild(tr);
+    }
+    // Default: chart the most-purchased item.
+    selectMerchantItem(name, items[0], tbody.querySelector('tr'));
+  }
+
+  panel.style.display = '';
+  panel.scrollIntoView({behavior: 'smooth', block: 'nearest'});
+}
+
+function selectMerchantItem(merchant, item, rowEl) {
+  document.querySelectorAll('#mdItems tbody tr').forEach(tr => tr.classList.remove('selected'));
+  if (rowEl) rowEl.classList.add('selected');
+  document.getElementById('mdChartTitle').textContent =
+    `${item.label} — price over time at ${merchant}`;
+  drawPriceTimeChart(
+    document.getElementById('mdChart'),
+    document.getElementById('mdChartMeta'),
+    item.entries,
+    240
+  );
+}
+
+document.getElementById('mdClose').addEventListener('click', () => {
+  selectedMerchant = null;
+  document.getElementById('merchantDetail').style.display = 'none';
+  renderMerchants();
+});
 
 // Recent receipts table.
 function renderRecent() {
@@ -651,19 +782,14 @@ function escape(s) {
   return s.replace(/"/g, '&quot;');
 }
 
-function renderProduct(key, repeats) {
-  const svg = document.getElementById('chartProduct');
-  const meta = document.getElementById('productMeta');
+// Shared price-over-time chart. `points` = [{date, price, merchant}].
+function drawPriceTimeChart(svg, metaEl, points, H) {
   svg.innerHTML = '';
-  meta.textContent = '';
-
-  const entry = repeats.find(([k, _]) => k === key);
-  if (!entry) return;
-
-  const [_, points] = entry;
+  metaEl.textContent = '';
+  if (!points.length) return;
   const sorted = points.slice().sort((a, b) => a.date.localeCompare(b.date));
 
-  const W = 800, H = 220;
+  const W = 800;
   const padL = 44, padR = 10, padT = 12, padB = 24;
   const innerW = W - padL - padR;
   const innerH = H - padT - padB;
@@ -713,7 +839,15 @@ function renderProduct(key, repeats) {
 
   const avg = prices.reduce((s, p) => s + p, 0) / prices.length;
   const merchants = new Set(sorted.map(x => x.merchant));
-  meta.textContent = `${sorted.length} purchases · avg ${fmtMoney(avg)} · ${merchants.size} merchant(s) · range ${fmtMoney(Math.min(...prices))} – ${fmtMoney(Math.max(...prices))}`;
+  metaEl.textContent = `${sorted.length} purchases · avg ${fmtMoney(avg)} · ${merchants.size} merchant(s) · range ${fmtMoney(Math.min(...prices))} – ${fmtMoney(Math.max(...prices))}`;
+}
+
+function renderProduct(key, repeats) {
+  const svg = document.getElementById('chartProduct');
+  const meta = document.getElementById('productMeta');
+  const entry = repeats.find(([k, _]) => k === key);
+  if (!entry) { svg.innerHTML = ''; meta.textContent = ''; return; }
+  drawPriceTimeChart(svg, meta, entry[1], 220);
 }
 
 // ----- View toggle wiring -----
