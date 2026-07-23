@@ -486,6 +486,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             totalsValues: Self.totalsValueSet(from: receipt),
             receiptTotal: receipt.totals.total
         )
+
         if !columnItems.isEmpty {
             receipt.lineItems = columnItems
         } else {
@@ -918,7 +919,10 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         // Structural agreement between items sum and total. The best signal
         // by far: if it balances, everything else was probably read right.
-        if total > 0 {
+        // Skipped when NO items were extracted — a zero sum against a real
+        // total isn't evidence of a bad read (cut-off photos legitimately
+        // have no item region); the empty-items branch below scores those.
+        if total > 0, !receipt.lineItems.isEmpty {
             let expected = itemsSum + tax + tip - discount
             let delta = abs(total - expected)
             let rel = delta / total
@@ -954,8 +958,26 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 score -= 0.10
             }
         } else {
-            // Zero line items on a non-trivial receipt is suspicious.
-            if total > 3 { score -= 0.15 }
+            // Zero line items with COHERENT money fields (subtotal + tax
+            // = total) is the cut-off-photo signature: the shot captured
+            // only the totals block, and there was nothing more to
+            // extract (IMG_3040 Grocery Outlet). The spend is real and
+            // verified by its own arithmetic — score medium so the
+            // receipt's total participates in trends, while the missing
+            // items keep it out of the high band.
+            let sub = receipt.totals.subtotal
+            if let sub, total > 0 {
+                let expected = doubleValue(sub) + tax
+                if abs(expected - total) <= 0.02 {
+                    score += 0.13
+                } else if total > 3 {
+                    score -= 0.15
+                }
+            } else if total > 3 {
+                // Zero line items on a non-trivial receipt with no
+                // corroborating subtotal is suspicious.
+                score -= 0.15
+            }
         }
 
         // Date parsed AND plausible. The "1970-01-01" sentinel means "no
@@ -2118,9 +2140,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         for line in lines {
             if Self.lineLooksLikeTotalsBoundary(line.text, keywords: totalsKeywords) {
                 let cy = line.box.y + line.box.height / 2
+                // ≥ 1 price above suffices: the slip-above case has ZERO
+                // prices above its top-of-frame "Total:" label, while a
+                // real boundary always has the item prices above it. A
+                // stricter above-vs-below comparison broke 1-item
+                // receipts, whose payment tail outnumbers the item
+                // region (IMG_8046).
                 let above = pricePoints.filter { $0.centerY < cy - 0.002 }.count
-                let below = pricePoints.count - above
-                guard above >= 2, above > below else { continue }
+                guard above >= 1 else { continue }
                 if cy < totalsBlockY { totalsBlockY = cy }
             }
         }
@@ -2213,28 +2240,52 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         func reject(_ p: PricePoint) {
             rejects.append(RejectedPricePoint(value: p.value, centerY: p.centerY, box: p.box))
         }
+        if ProcessInfo.processInfo.environment["OCR_DEBUG_COL"] != nil {
+            let msg = "COL: pricePoints=\(pricePoints.count) medianX=\(medianX) inColumn=\(inColumn.count) totalsBlockY=\(totalsBlockY) labelYs=\(labelYs.count)\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            for p in inColumn {
+                FileHandle.standardError.write(Data("  point v=\(p.value) cy=\(p.centerY) x=\(p.box.x)\n".utf8))
+            }
+        }
+        let debugCol = ProcessInfo.processInfo.environment["OCR_DEBUG_COL"] != nil
+        func dbg(_ s: String) {
+            if debugCol { FileHandle.standardError.write(Data((s + "\n").utf8)) }
+        }
+        // Implausibly-large filter setup. The ceiling protects against
+        // decimal-lost misreads ("$99" from "$4.99") — but it derives
+        // from FM's UNVERIFIED total. When FM grabs a tiny bogus value
+        // (the "$1.00" YOUR-SAVINGS total on Safeway), a trusted ceiling
+        // silently kills every real item, column extraction comes back
+        // empty, and the total sanity check loses the items-sum signal
+        // it needs to detect the bad total — a vicious circle
+        // (IMG_3555: 5-item $27.52 receipt extracted as 0 items @ $1).
+        // Rule: if the ceiling would eliminate MORE THAN HALF of the
+        // in-column points, the total is what's wrong — don't apply it.
+        let hasNegatives = pricePoints.contains { $0.value < 0 }
+        let ceilingFactor: Decimal = hasNegatives ? 3 : 1
+        let priceCeiling: Decimal? = {
+            guard receiptTotal > 0 else { return nil }
+            let c = receiptTotal * ceilingFactor
+            let over = inColumn.filter { $0.value > c }.count
+            return over * 2 <= inColumn.count ? c : nil
+        }()
         for p in inColumn {
             // Filter: below the totals block. NOT added to the rejects
             // ledger — payment / change / tender rows must never be
             // re-admitted as items, even when they'd balance the books.
-            if p.centerY >= totalsBlockY - 0.002 { continue }
+            if p.centerY >= totalsBlockY - 0.002 { dbg("SKIP totals-block v=\(p.value)"); continue }
             // Filter: equals a known totals value. Also not re-admittable.
-            if totalsValues.contains(p.value) { continue }
+            if totalsValues.contains(p.value) { dbg("SKIP totals-value v=\(p.value)"); continue }
             // Filter: adjacent to a regular-price / member-savings label.
-            if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { reject(p); continue }
+            if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { dbg("SKIP label-adj v=\(p.value)"); reject(p); continue }
             // Filter: implausibly large value. Vision sometimes mangles a
             // price like "$4.99" into just "99" (decimal point lost). The
             // resulting "$99" exceeds the receipt total and is obviously
-            // wrong. Ceiling depends on whether the receipt has any
-            // negative-value observations in the column: with credits
-            // present, big positive items (offset by negative ones) are
-            // legit (IMG_4161 Ace: CARBONATOR $34.99 + -$15.50 credit =
-            // $19.49 net); without credits, prices above total are almost
-            // always misreads (IMG_2460 Safeway: bogus $79 ADOBO from
-            // OCR noise).
-            let hasNegatives = pricePoints.contains { $0.value < 0 }
-            let ceilingFactor: Decimal = hasNegatives ? 3 : 1
-            if receiptTotal > 0, p.value > receiptTotal * ceilingFactor { continue }
+            // wrong. With credits present, big positive items (offset by
+            // negative ones) are legit (IMG_4161 Ace: CARBONATOR $34.99
+            // + -$15.50 credit = $19.49 net). `priceCeiling` is nil when
+            // the FM total itself is implausible — see setup above.
+            if let c = priceCeiling, p.value > c { dbg("SKIP over-ceiling v=\(p.value)"); continue }
 
             // Pick the BEST single text observation to the left, within
             // ±2 line-heights vertically. Strategy:
@@ -2262,7 +2313,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 if t.range(of: priceShape, options: .regularExpression) != nil { continue }
                 candidates.append((t, line.box.x, dy))
             }
-            guard !candidates.isEmpty else { reject(p); continue }
+            guard !candidates.isEmpty else { dbg("SKIP no-candidates v=\(p.value)"); reject(p); continue }
 
             candidates.sort { a, b in
                 // Bucket dy by 0.005 — descriptions on truly the same row
@@ -2296,7 +2347,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     (c.dy / 0.005).rounded(.down) == closestBucket
                         && Self.labelOwnsPrice(c.text)
                 }
-                if owned { reject(p); continue }
+                if owned { dbg("SKIP label-owned v=\(p.value)"); reject(p); continue }
             }
 
             // Walk sorted candidates and take the FIRST one that
@@ -2321,7 +2372,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 cleaned = candidate
                 break
             }
-            guard let cleaned else { reject(p); continue }
+            guard let cleaned else { dbg("SKIP no-desc v=\(p.value)"); reject(p); continue }
 
             // Step 7: inherit qty / unit / category from FM if it
             // extracted a matching item.
@@ -3010,9 +3061,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // extraction — but that class of false positive is now
         // gone since column-anchored extraction dedupes
         // actual/regular price pairs before items_sum is computed.)
+        // Count gate relaxed for receipts WITHOUT negative items: a
+        // 1-item Safeway run whose FM total is the "$1.00" savings
+        // total (IMG_8046: ROTINI $4.58 against total $1) can never
+        // reach 3 items, but positives at 2× the total is just as
+        // conclusive there. Receipts WITH credits keep the 3-item gate
+        // — a big item offset by a refund legitimately exceeds the
+        // total (IMG_4161 Ace).
+        let hasNegativeItems = receipt.lineItems.contains { $0.totalPrice < 0 }
         let savingsBlockConfusion =
-            receipt.lineItems.count >= 3
-            && positivesSum > fmTotal * Decimal(2)
+            positivesSum > fmTotal * Decimal(2)
+            && (receipt.lineItems.count >= 3 || (!hasNegativeItems && !receipt.lineItems.isEmpty))
 
         // Flag 3: fmTotal implausibly large vs items — 5× or more.
         // IMG_5353 landed on $8851 for an 11-item Safeway; that's a
