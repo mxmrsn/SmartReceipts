@@ -306,7 +306,7 @@
     </div>
   </div>
   <div class="panel c-6">
-    <h3>Recent Receipts <span class="helper">low confidence highlighted</span></h3>
+    <h3>Recent Receipts <span class="helper">all receipts — low confidence highlighted, excluded from trends</span></h3>
     <div class="scrollable">
       <table id="tableRecent">
         <thead><tr>
@@ -414,30 +414,46 @@ const SECTOR_COLORS = {
 
 // ----- State -----
 let currentView = 'month';
-const data = RAW_DATA;
+
+// Trust gate: receipts below this confidence are OMITTED from every
+// chart, trend, and aggregate — their numbers are extraction guesses,
+// not facts, and would distort spend totals and price trends. They
+// remain visible in Recent Receipts (red pill) and are counted in the
+// header so the exclusion is never silent.
+const CONF_FLOOR = 0.6;
+const allData = RAW_DATA;
+const data = allData.filter(r => r.confidence >= CONF_FLOOR);
+const lowConfExcluded = allData.length - data.length;
 
 // Global stats.
 function updateStats() {
+  // Spend figures come from TRUSTED receipts only; confidence stats
+  // describe the whole corpus so extraction quality stays honest.
   const total = data.reduce((s, r) => s + r.total, 0);
   const count = data.length;
   const avg = count ? total / count : 0;
-  const conf = count ? data.reduce((s, r) => s + r.confidence, 0) / count : 0;
-  const hi = data.filter(r => r.confidence >= 0.85).length;
+  const confAll = allData.length
+    ? allData.reduce((s, r) => s + r.confidence, 0) / allData.length : 0;
+  const hi = allData.filter(r => r.confidence >= 0.85).length;
 
   document.getElementById('statTotal').textContent = fmtMoney(total);
   document.getElementById('statCount').textContent = fmtInt(count);
   document.getElementById('statAvg').textContent = fmtMoney(avg);
-  document.getElementById('statConf').innerHTML = `${(conf * 100).toFixed(0)}<span class="delta">/100</span>`;
-  document.getElementById('statConfHelper').textContent = `${hi} of ${count} at ≥ 0.85`;
+  document.getElementById('statConf').innerHTML = `${(confAll * 100).toFixed(0)}<span class="delta">/100</span>`;
+  document.getElementById('statConfHelper').textContent =
+    `${hi} of ${allData.length} at ≥ 0.85 · ${lowConfExcluded} below ${CONF_FLOOR} excluded from trends`;
 
   const dates = data.map(r => r.date).filter(Boolean).sort();
   if (dates.length) {
-    document.getElementById('statTotalHelper').textContent = `${dates[0]} → ${dates[dates.length - 1]}`;
-    document.getElementById('statCountHelper').textContent = `${new Set(data.map(r => r.merchant)).size} unique merchants`;
+    document.getElementById('statTotalHelper').textContent =
+      `${dates[0]} → ${dates[dates.length - 1]} · trusted receipts only`;
+    document.getElementById('statCountHelper').textContent =
+      `${new Set(data.map(r => r.merchant)).size} unique merchants · ${lowConfExcluded} low-conf excluded`;
   }
 
   document.getElementById('subtitle').textContent =
-    `${count} receipts extracted · ${new Set(data.map(r => r.merchant)).size} merchants · avg confidence ${(conf * 100).toFixed(0)}%`;
+    `${count} of ${allData.length} receipts in trends (${lowConfExcluded} low-confidence excluded) · ` +
+    `${new Set(data.map(r => r.merchant)).size} merchants · avg confidence ${(confAll * 100).toFixed(0)}%`;
 }
 
 // Spending trend chart.
@@ -693,11 +709,13 @@ document.getElementById('mdClose').addEventListener('click', () => {
   renderMerchants();
 });
 
-// Recent receipts table.
+// Recent receipts table. Deliberately uses ALL receipts, including
+// the low-confidence ones excluded from charts — this is where the
+// user sees what needs a second look (red pills).
 function renderRecent() {
   const tbody = document.querySelector('#tableRecent tbody');
   tbody.innerHTML = '';
-  const sorted = [...data].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 40);
+  const sorted = [...allData].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 40);
   for (const r of sorted) {
     const band = confidenceBand(r.confidence);
     tbody.insertAdjacentHTML('beforeend', `<tr>
