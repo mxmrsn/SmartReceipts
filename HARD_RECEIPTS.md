@@ -88,6 +88,26 @@ Only 1 item extracted from a receipt with several. Layout unknown yet.
 - IMG_1741 Walgreens (conf 0.10)
 - IMG_2171 Madewell (conf 0.10)
 
+## Residual after the item-extraction round (2026-07-22, later)
+
+Confidence distribution across all 1,183: **728 high (≥ 0.85)**,
+159 medium, 296 low — up from 617/223/343 at the start of the day.
+Remaining low-confidence buckets:
+
+- **under-half (105) + under (106)** — items genuinely missing from
+  extraction. Root causes seen: Vision drops price cents entirely
+  ("$8" with no recoverable fragment — IMG_7496's chicken rows),
+  faded thermal print, crumpled/folded geometry. Needs better OCR
+  input (region re-scan at higher resolution?) more than parsing.
+- **over (44) + doubled (18)** — over-extraction survivors; several
+  are folded-receipt geometry (IMG_5085 photographs two column
+  bands side by side).
+- **close-low (16)** — sum within 15% but confidence dinged by
+  missing dates/merchants or unresolved tax.
+- The checksum repair (single-move drop/re-admit) fires only on
+  exact ±1¢ residual matches; multi-item gaps stay for honest
+  low-confidence flagging.
+
 ## Residual after the 2026-07-22 audit
 
 All 1,183 receipts extract; 1,180 land in the dashboard (2 JPY
