@@ -62,6 +62,28 @@ public enum ReceiptImagePreprocessor {
         image: CGImage,
         orientation: CGImagePropertyOrientation
     ) -> Preprocessed {
+        preprocess(image: image, orientation: orientation, force: false)
+    }
+
+    /// Like `preprocess`, but corrects whenever a plausible quad is
+    /// detected — no well-framed skip. Used by the low-confidence
+    /// escalation path: a mildly tilted receipt (≈ 5°) passes the
+    /// conservative gate yet breaks every same-row pairing heuristic
+    /// (label at one X pairs with the value 1.5 rows away at another).
+    /// Dewarping straightens the rows; the escalation keeps the result
+    /// only if the re-run scores higher.
+    public static func preprocessForced(
+        image: CGImage,
+        orientation: CGImagePropertyOrientation
+    ) -> Preprocessed {
+        preprocess(image: image, orientation: orientation, force: true)
+    }
+
+    private static func preprocess(
+        image: CGImage,
+        orientation: CGImagePropertyOrientation,
+        force: Bool
+    ) -> Preprocessed {
         guard let quad = detectDocumentQuad(image: image, orientation: orientation) else {
             return Preprocessed(
                 image: image,
@@ -83,7 +105,7 @@ public enum ReceiptImagePreprocessor {
         // extraction and FM total-picking. The old rotation-detection
         // heuristic (`correctRotatedObservations`) handles small tilts
         // adequately without a full image transform.
-        if !shouldCorrect(quad: quad) {
+        if !force, !shouldCorrect(quad: quad) {
             return Preprocessed(
                 image: image,
                 orientation: orientation,

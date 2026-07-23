@@ -91,6 +91,26 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             usedLines = tiled
         }
 
+        // ---- 2c) Escalation: forced perspective correction ----
+        // The conservative preprocessing gate skips dewarp for medium-
+        // area receipts, but a mild tilt (≈ 5°) that passes the gate
+        // still drifts same-row label/value pairs a full row apart
+        // across the page width, defeating every pairing heuristic
+        // (IMG_2587: "**** BALANCE" and its 39.49 split by dy 0.025).
+        // If confidence is still low, dewarp unconditionally, re-run,
+        // and keep the winner.
+        if receipt.provenance.confidence < 0.6, !prep.didCorrect {
+            let forced = ReceiptImagePreprocessor.preprocessForced(image: image, orientation: orientation)
+            if forced.didCorrect,
+               let straightLines = try? Self.recognizeLines(image: forced.image, orientation: forced.orientation),
+               !straightLines.isEmpty,
+               let retry = try? await Self.extractReceipt(from: straightLines),
+               retry.provenance.confidence > receipt.provenance.confidence {
+                receipt = retry
+                usedLines = straightLines
+            }
+        }
+
         let elapsedMs = Int((DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000_000)
         return ExtractionResult(
             receipt: receipt,
@@ -2088,10 +2108,19 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             "drive-take out", "drive thru", "drive-thru", "dine-in",
             "dine in", "for here", "to go", "take out", "takeout",
         ]
+        // A totals label only bounds the item region when actual item
+        // prices sit ABOVE it. Receipts photographed with the payment
+        // slip laid on top of the receipt put a "Total:" at the TOP of
+        // the frame (IMG_4253 Sprouts) — taking the minimum label Y
+        // filtered out every real item, column extraction returned
+        // empty, and the FM fallback's corrupt values leaked through.
         var totalsBlockY: Double = 1.0
         for line in lines {
             if Self.lineLooksLikeTotalsBoundary(line.text, keywords: totalsKeywords) {
                 let cy = line.box.y + line.box.height / 2
+                let above = pricePoints.filter { $0.centerY < cy - 0.002 }.count
+                let below = pricePoints.count - above
+                guard above >= 2, above > below else { continue }
                 if cy < totalsBlockY { totalsBlockY = cy }
             }
         }
