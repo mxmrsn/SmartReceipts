@@ -1,5 +1,18 @@
 # Hard-to-parse receipts
 
+## Current state (2026-07-22, after slip-above + forced-dewarp round)
+
+1,183/1,183 extract. **843 high (≥ 0.85) · 222 medium · 115 low.**
+Avg confidence 0.865. The dashboard's trust gate (CONF_FLOOR 0.6)
+excludes the 115 low-confidence receipts from every chart and trend
+— they surface only in Recent Receipts with red pills. The
+escalation ladder is standard → tiled 2× re-scan → forced dewarp;
+allow ~8 min/receipt worst-case when re-extracting (extractor
+timeout raised to 480 s after 3 receipts hit the old 240 s cap).
+
+Remaining 115: thermal fade / crumples with unrecoverable text,
+plus assorted one-offs (IMG_8572 candy-deal pricing, IMG_4084).
+
 Living TODO list of receipts that don't yet extract cleanly. Cross out
 (`~~IMG_XXXX~~`) as they're resolved. When a whole failure mode is
 retired, remove the section.
