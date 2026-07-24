@@ -2,13 +2,13 @@
 
 ## Current state (2026-07-24, after column-election + net-items batch)
 
-1,183/1,183 extract, zero failures. **962 high (>= 0.85) - 166 medium
-- 55 low.** Avg confidence 0.913. Day's arc this session: 877/228/78
--> 962/166/55, avg 0.885 -> 0.913.
+1,183/1,183 extract, zero failures. **976 high (>= 0.85) - 155 medium
+- 52 low.** Avg confidence 0.918. Day's arc this session: 877/228/78
+-> 976/155/52, avg 0.885 -> 0.918.
 
-Seven systematic fixes this session, each traced to a real receipt and
+Eight systematic fixes this session, each traced to a real receipt and
 verified against the ground-truth photo, zero regressions across the
-guard set:
+guard set (checked on BOTH confidence and item-sum):
 1. Checksum + tax-marker COLUMN ELECTION — Safeway's two-column
    "Price | You Pay" layout now elects the paid column by matching a
    printed BALANCE/PAYMENT AMOUNT (± tax) to the cent, or by tax-marker
@@ -24,8 +24,18 @@ guard set:
 6. Net-sales / total-taxes / taxable-amount non-item filter.
 7. Unit+extended duplicate dedup (same value, one row, two X columns;
    Ace IMG_3658 0.30 -> 1.00).
+8. Checksum-gated over-extraction repair — balanceItemsAgainstChecksum
+   now reconciles against the OCR's OWN label-anchored totals (not FM's
+   possibly-bogus total): drop one of a duplicated value, or re-admit a
+   filtered NEGATIVE reject (coupon) whose magnitude equals the excess,
+   re-anchoring the total to the printed value it lands on (Safeway
+   IMG_4084 -$5 coupon 0.45 -> 1.00). Guarded so it never disturbs a
+   list already balancing against the receipt's own total, and never
+   builds a total-minus-tax target (which a wrong extracted tax would
+   rubber-stamp — caught IMG_5026 5-item + phantom $6.99-tax regression
+   via item-sum checking, not confidence alone).
 
-### Remaining 55 low — the documented floor (37 under / 13 over / 5 zero)
+### Remaining 52 low — the documented floor (35 under / 12 over / 5 zero)
 
 **Genuine OCR under-extraction (37).** Confirmed by pulling the photos:
 Vision does not emit price tokens for many items on crumpled / faded /
@@ -35,20 +45,24 @@ recover text the sensor did not capture. Examples: Trader Joe's IMG_7345
 Grocery Outlet (5), Target long receipts (IMG_3060), Hashi, Sprouts.
 Not fixable at the parse layer — needs better input.
 
-**Diverse over-extraction (13), causes identified but each risky to fix:**
+**Diverse over-extraction (12) — no single exact-move reconciliation,
+so the checksum gate correctly declines rather than guess:**
 - Safeway ceiling-circle (IMG_6003): bogus FM total $3.99 makes the
-  price-ceiling kill the $4.49 item; real total $16.11 prints twice.
-- Safeway coupon-as-negative (IMG_4084): a real -$5.00 coupon is filtered
-  as savings-metadata; keeping it (34.49 - 5 = 29.49) would reconcile,
-  but that inverts the per-item "Member Savings" filtering we rely on
-  elsewhere. Needs checksum-gated disambiguation — high regression risk.
-- Safeway stacked regular/paid at same X (IMG_4084/7603): same value
-  printed twice vertically (no discount, regular==paid); dedup requires
-  a horizontal gap to avoid merging genuine same-priced stacked items.
-- Restaurant qty (In-N-Out IMG_2035): "2 Hamburger" quantity misread.
-- Oriental Grocery / Hashi two-column variants (IMG_6857/6642/7849):
-  non-Safeway two-column layouts the election doesn't cover.
+  price-ceiling kill the $4.49 item and drop the $3.99 item as a
+  totals-value; real total $16.11 prints twice. The dropped $3.99 is
+  NOT in the rejects ledger, so it can't be re-admitted — genuinely
+  unrecoverable without re-OCR.
+- Oriental Grocery / Hashi two-column variants (IMG_6857 2.7x, IMG_6642,
+  IMG_7849): non-Safeway two-column layouts the election doesn't cover;
+  over-count spans multiple duplicated rows, not one exact move.
+- Restaurant qty (In-N-Out IMG_2035): "2 Hamburger" quantity misread —
+  the excess isn't a droppable line value.
+- Safeway multi-duplicate (IMG_7603/2557/1635): several regular-price
+  rows counted; no single value equals the exact residual to a printed
+  total.
+- Sprouts IMG_5627 (1.05x): slight over, off by rounding.
 - Taco Mana IMG_1531 (2.9x): FM output triples items (malformed JSON).
+- FIXED this session: Safeway coupon IMG_4084 (-$5 re-admit -> 29.49).
 
 **Zero-total (5), all correct or harmless:** IMG_6643 unreadable,
 IMG_3557/8304 USPS/USPS $0 label receipts (correctly $0, excluded from
