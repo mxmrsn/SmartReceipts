@@ -1,6 +1,35 @@
 # Hard-to-parse receipts
 
-## Current state (2026-07-22, after savings-total-circle round)
+## Current state (2026-07-23, after checksum-anchored-totals batch)
+
+1,183/1,183 extract, zero failures (1,424 s wall, 6 workers).
+**877 high (>= 0.85) - 228 medium - 78 low.** Avg confidence 0.885.
+Dashboard: 1,179 receipts loaded, 1,103 in trends, 76 excluded by
+the trust gate, trusted spend $48,753.83.
+
+This round's fixes: checksum-anchored total re-selection (a totals-
+label value matching the items sum to the cent beats FM's pick),
+thousands-comma price shapes, department ring-up items, Old Navy
+"Item Discount" metadata, dual-target checksum repair (subtotal and
+total-tax-tip), Lytt struck-price drop. Low tail 98 -> 78.
+
+Remaining 78 by cluster (worst first):
+- **Safeway under-extraction (~20)** — the stacked metadata layout
+  still loses rows when Vision fragments prices; largest cluster.
+- **Grocery Outlet (~6), Whole Foods (~6), Trader Joe's (~4),
+  Hashi (~3)** — same shape: items sum short of total.
+- **Old Navy / Mens Wearhouse (4)** — return/discount sign flips;
+  IMG_2107 improved (-27.99 -> +53.99) but still partial.
+- **In-N-Out (2), DOHATSUTEN (2), La Baguette (2 dupes)** — layout
+  one-offs.
+- **TASSI IMG_5265** — items understate ($64.80 vs $2,224.80 total);
+  total itself is correct.
+- **True floor**: IMG_4412 faded Target, IMG_6643 unreadable,
+  USPS $0-total label receipts (correct extractions, harmlessly
+  excluded), IMG_3040 zero usable price text.
+
+
+## Previous state (2026-07-22, after savings-total-circle round)
 
 1,183/1,183 extract. **861 high (>= 0.85) - 224 medium - 98 low.**
 Avg confidence 0.875. Dashboard: 1,083 of 1,179 receipts in trends,
