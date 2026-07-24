@@ -616,6 +616,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             rejects: rejectedPoints,
             lines: postLines
         )
+        // Informational discount line items (Old Navy): each garment
+        // prints its NET price ("35.99 T", already 44.99 − 9.00) followed
+        // by an "Item Discount -9.00" breakdown row. FM emits both, so
+        // the discount double-counts. When the POSITIVE items alone sum
+        // to the printed subtotal (or total − tax) while the full list
+        // doesn't, the negatives are informational — drop them.
+        receipt = Self.dropInformationalDiscountItems(receipt)
         // Late arithmetic pass, AFTER all item filtering has settled:
         // when the items independently sum to the printed total, any
         // nonzero tax / tip / discount is arithmetically impossible —
@@ -891,6 +898,55 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// See call site: clears phantom tax / tip / discount when the final
     /// item list already sums to the total, and clamps tax down to the
     /// arithmetic gap when items nearly reach the total on their own.
+    /// Drop negative "discount"-type line items that double-count an
+    /// already-net item price. Old Navy prints each garment at its net
+    /// price and then an informational "Item Discount -9.00" breakdown
+    /// row; FM emits both, so the negatives subtract a discount that the
+    /// positive price already reflects. Signature: the POSITIVE items
+    /// alone reconcile with a printed target (subtotal, or total − tax −
+    /// tip) while the full signed list does not. Only discount-phrased
+    /// negatives are eligible, so genuine return/credit lines are safe.
+    private static func dropInformationalDiscountItems(_ input: Receipt) -> Receipt {
+        var receipt = input
+        let negatives = receipt.lineItems.filter { $0.totalPrice < 0 }
+        guard !negatives.isEmpty else { return receipt }
+        // Every negative must be a discount-type row for this to be the
+        // informational-breakdown pattern; a lone return credit among
+        // positives is a different animal and must not be touched.
+        let discountLike: (Receipt.LineItem) -> Bool = { item in
+            let lc = item.description.lowercased()
+            return lc.contains("discount") || lc.contains("savings")
+                || lc.contains("% off") || lc.contains("off ")
+        }
+        guard negatives.allSatisfy(discountLike) else { return receipt }
+
+        let positiveSum = receipt.lineItems.filter { $0.totalPrice > 0 }
+            .reduce(Decimal(0)) { $0 + $1.totalPrice }
+        let fullSum = receipt.lineItems.reduce(Decimal(0)) { $0 + $1.totalPrice }
+        guard positiveSum > 0 else { return receipt }
+
+        let tax = receipt.totals.tax.reduce(Decimal(0)) { $0 + $1.amount }
+        let tip = receipt.totals.tip ?? 0
+        var targets: [Decimal] = []
+        if let s = receipt.totals.subtotal, s > 0 { targets.append(s) }
+        if receipt.totals.total > 0 { targets.append(receipt.totals.total - tax - tip) }
+        guard !targets.isEmpty else { return receipt }
+
+        func matches(_ v: Decimal, _ t: Decimal) -> Bool {
+            let tol = max(Decimal(0.02), t * Decimal(0.005))
+            let d = v - t
+            return d <= tol && d >= -tol
+        }
+        // Positives alone hit a target, and the signed sum doesn't — the
+        // negatives are the informational breakdown.
+        let positivesReconcile = targets.contains { matches(positiveSum, $0) }
+        let fullReconciles = targets.contains { matches(fullSum, $0) }
+        guard positivesReconcile, !fullReconciles else { return receipt }
+
+        receipt.lineItems.removeAll { $0.totalPrice < 0 }
+        return receipt
+    }
+
     private static func reconcileItemsVsTotals(_ input: Receipt) -> Receipt {
         var receipt = input
         let total = receipt.totals.total
