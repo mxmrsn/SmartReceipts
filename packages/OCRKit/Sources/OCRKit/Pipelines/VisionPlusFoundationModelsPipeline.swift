@@ -2054,6 +2054,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         "amex", "american express", "discover",
         "change", "cash", "tender", "tendered",
         "subtotal", "sub total", "sub-total",
+        "net sales", "net sale", "net total", "total taxes", "total tax",
+        "taxable amount", "total savings", "total discount",
         "tax", "sales tax", "vat", "gst", "hst",
         "tip", "gratuity",
         "total", "grand total", "amount due", "amount paid", "amount payable",
