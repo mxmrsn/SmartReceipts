@@ -503,6 +503,10 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // $161.99 when the receipt prints $93.16). Cross-check against
         // (a) the value actually appearing in OCR near a totals label
         // and (b) the arithmetic sum of line items plus tax.
+        // A negative tax is impossible; drop it before the total sanity
+        // check so it can't corroborate a wrong total or poison the
+        // net-items arithmetic (IMG_8253 read tax "-1.25").
+        receipt = Self.dropInvalidTax(receipt)
         receipt = Self.sanityCheckTotal(receipt: receipt, lines: postLines)
         // Same idea for subtotal / tax / tip — find the OCR label,
         // grab its adjacent value. FM sometimes cross-wires these
@@ -842,7 +846,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             guard candidates.count == 1, let point = candidates.first else { continue }
 
             // Nearest non-price text to the left for the description.
-            let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]){0,2}$"#
+            let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]{1,2}){0,2}$"#
             var bestDesc: (text: String, dy: Double)? = nil
             for line in lines {
                 let cy = line.box.y + line.box.height / 2
@@ -866,6 +870,20 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 category: nil
             ))
             return receipt
+        }
+        return receipt
+    }
+
+    /// A tax amount is never negative on a real receipt. FM occasionally
+    /// reads a savings figure or a misaligned column value into the tax
+    /// slot with a stray minus (IMG_8253: tax "-1.25"). Drop it so the
+    /// bogus value can't corroborate a wrong total or skew confidence.
+    private static func dropInvalidTax(_ input: Receipt) -> Receipt {
+        var receipt = input
+        let before = receipt.totals.tax.count
+        receipt.totals.tax.removeAll { $0.amount < 0 }
+        if receipt.totals.tax.count != before {
+            receipt.provenance.fieldConfidence["totals.tax"] = 0.3
         }
         return receipt
     }
@@ -2010,7 +2028,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let valueShape = #"^-?\$?\d{1,3}(?:,\d{3})*[.,]\d{2}$"#
         func value(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             guard trimmed.range(of: valueShape, options: .regularExpression) != nil else { return nil }
             let normalized = trimmed
                 .replacingOccurrences(of: "$", with: "")
@@ -2114,7 +2132,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // price and inflates items_sum (IMG_2460 Safeway "$79 ADOBO"
         // is really $2.79). Real whole-dollar amounts are rare
         // enough that this trade-off pays off across the sample.
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]{1,2}){0,2}$"#
 
         // Step 1: every price-shaped observation with its value.
         // Also flag whether the observation carried a tax-category
@@ -2130,7 +2148,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             let hasTaxMarker: Bool
         }
         let taxMarkerSuffix = try? NSRegularExpression(
-            pattern: #"\d\s+[A-Z]\s*$"#,
+            pattern: #"\d\s+[A-Z]{1,2}\s*$"#,
             options: []
         )
         var pricePoints: [PricePoint] = []
@@ -2141,7 +2159,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: "$", with: "")
                 .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
             // Accept negative prices — they're legitimate line items
             // (voided items, exchange credits, Safety Captain discounts,
@@ -2188,18 +2206,38 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // the frame (IMG_4253 Sprouts) — taking the minimum label Y
         // filtered out every real item, column extraction returned
         // empty, and the FM fallback's corrupt values leaked through.
+        // Values that print ≥ 3 times are almost certainly the grand
+        // total (Subtotal / Net Sales / Total / payment copies all carry
+        // it). Treated as totals values below so a flipped receipt's
+        // stack of identical totals can't masquerade as "item prices
+        // above" the boundary.
+        let repeatedValues: Set<Decimal> = {
+            var counts: [Decimal: Int] = [:]
+            for p in pricePoints { counts[p.value, default: 0] += 1 }
+            return Set(counts.filter { $0.value >= 3 }.keys)
+        }()
         var totalsBlockY: Double = 1.0
         for line in lines {
             if Self.lineLooksLikeTotalsBoundary(line.text, keywords: totalsKeywords) {
                 let cy = line.box.y + line.box.height / 2
-                // ≥ 1 price above suffices: the slip-above case has ZERO
-                // prices above its top-of-frame "Total:" label, while a
-                // real boundary always has the item prices above it. A
-                // stricter above-vs-below comparison broke 1-item
-                // receipts, whose payment tail outnumbers the item
-                // region (IMG_8046).
-                let above = pricePoints.filter { $0.centerY < cy - 0.002 }.count
-                guard above >= 1 else { continue }
+                // Require ≥ 1 genuine ITEM price above — not a totals
+                // value and not a value repeated ≥ 3× (both are the
+                // total echoed through the totals block). The slip-above
+                // case has ZERO prices above its top-of-frame "Total:"
+                // label; a real boundary always has item prices above.
+                // The item-price qualifier additionally rescues FLIPPED
+                // receipts (Whole Foods photographed 180°, IMG_8245):
+                // there the totals block sits ABOVE the items in OCR Y,
+                // and the only prices above a totals label are echoes of
+                // the total — so no boundary is set, the total echoes
+                // filter as totals values, and the real items below
+                // survive to reconcile against the total.
+                let itemPricesAbove = pricePoints.filter {
+                    $0.centerY < cy - 0.002
+                        && !totalsValues.contains($0.value)
+                        && !repeatedValues.contains($0.value)
+                }.count
+                guard itemPricesAbove >= 1 else { continue }
                 if cy < totalsBlockY { totalsBlockY = cy }
             }
         }
@@ -2271,7 +2309,22 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // whose sum matches a label-anchored totals target to the cent.
         // Falls back to the legacy pick when nothing matches (missing
         // rows, misread digits) — no behavior change there.
-        let xs = pricePoints.map(\.box.x).sorted()
+        //
+        // Column X is derived from ITEM-REGION prices only (above the
+        // totals block). On short receipts the totals block prints more
+        // values than there are items (Subtotal / Savings / Net / Tax /
+        // Total — 5+ values vs 2 items on Whole Foods IMG_8129), and
+        // those right-aligned totals values pull the median X off the
+        // item column, excluding the real item prices from the ±0.05
+        // band entirely. The totals values get filtered as totals-block
+        // anyway, so they have no business defining where the item
+        // column is. Fall back to all points if the item region is too
+        // sparse to be reliable.
+        let itemRegionXs = pricePoints
+            .filter { $0.centerY < totalsBlockY - 0.002 }
+            .map(\.box.x)
+            .sorted()
+        let xs = itemRegionXs.count >= 2 ? itemRegionXs : pricePoints.map(\.box.x).sorted()
         let legacyMedianX: Double = {
             guard xs.count >= 4 else { return xs[xs.count / 2] }
             var largestGap: Double = 0
@@ -2558,6 +2611,20 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // block — when this value does, those occurrences are item
             // rows; keep them and let sanityCheckTotal fix the total.
             if totalsValues.contains(p.value) {
+                // A value that appears ≥ 3× AND equals a printed total
+                // is the total echoed through Subtotal / Net Sales /
+                // Total / payment rows — never three identical items.
+                // Force-skip ONLY when no totals boundary was found
+                // (the flipped-receipt path: echoes sit among the items
+                // and would otherwise be re-admitted via the two-
+                // sandwiches exception below — IMG_8245: 33.20 ×3).
+                // When a boundary IS set, a value can legitimately be
+                // both an item price and the subtotal on a single-item
+                // receipt (IMG_8040 Lytt: $84.95 item == subtotal ==
+                // total, printed 3×); leave those to the exception.
+                if repeatedValues.contains(p.value), totalsBlockY >= 0.999 {
+                    dbg("SKIP totals-echo v=\(p.value)"); continue
+                }
                 let dupesAbove = inColumn.filter {
                     $0.value == p.value && $0.centerY < totalsBlockY - 0.002
                 }.count
@@ -2750,7 +2817,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]{1,2}){0,2}$"#
 
         // Compute the price column from prices already matched to OCR.
         // Claim ONE OCR observation per extracted item. The set
@@ -2784,7 +2851,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                         with: "$1.$2",
                         options: .regularExpression
                     )
-                    .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                    .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
                 guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
                 if v == item.totalPrice {
                     matchedPriceXs.append(line.box.x)
@@ -2880,7 +2947,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: "$", with: "")
                 .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             // Don't promote a totals-block value.
             guard !totalsValues.contains(normalized) else { continue }
             guard let priceValue = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
@@ -3000,7 +3067,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]{1,2}){0,2}$"#
 
         func priceValue(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
@@ -3009,7 +3076,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: "$", with: "")
                 .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
         }
 
@@ -3364,7 +3431,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let expected: Decimal = itemsSum + taxSum + tip - discount
 
         // Does FM's total actually appear anywhere in the OCR?
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]{1,2}){0,2}$"#
         func priceValue(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
@@ -3372,7 +3439,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: "$", with: "")
                 .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
         }
         let fmTotalPresent = lines.contains { line in
@@ -3588,19 +3655,42 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // totals label) beats FM's field choice. Requires ≥ 2 items so
         // a single mis-extracted item can't force a re-anchor.
         let expectedFromItems = itemsSum + taxSum + tip - discount
+        func candidateMatches(_ target: Decimal) -> Bool {
+            candidates.contains { c in
+                let d = c.value - target
+                return d < Decimal(0.02) && d > Decimal(-0.02)
+            }
+        }
+        func fmDiffers(from target: Decimal) -> Bool {
+            let d = fmTotal - target
+            return d > Decimal(0.02) || d < Decimal(-0.02)
+        }
         let betterArithmeticCandidate =
             !receipt.lineItems.isEmpty
             && expectedFromItems > 0
-            && candidates.contains { c in
-                let d = c.value - expectedFromItems
-                return d < Decimal(0.02) && d > Decimal(-0.02)
-            }
-            && {
-                let d = fmTotal - expectedFromItems
-                return d > Decimal(0.02) || d < Decimal(-0.02)
-            }()
+            && candidateMatches(expectedFromItems)
+            && fmDiffers(from: expectedFromItems)
 
-        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount || wholeDollarLarge || totalEqualsItemPrice || betterArithmeticCandidate else { return receipt }
+        // Flag 7b: net-of-savings items. Whole Foods (and other loyalty
+        // programs) print each line item at its ALREADY-DISCOUNTED price
+        // and show "Total Savings -$2.30" purely for information. FM
+        // stuffs that savings figure into `discount`, which then double-
+        // counts: items already net → itemsSum + tax IS the total, but
+        // expectedFromItems subtracts the discount again and matches
+        // nothing. When itemsSum + tax (ignoring discount) hits a
+        // printed total candidate that FM missed, the items are net and
+        // the discount field is spurious. (IMG_8129: items 14.47 + tax
+        // 0.72 = 15.19 == printed Total, FM picked the 16.17 subtotal.)
+        let expectedNet = itemsSum + taxSum + tip
+        let itemsAreNet =
+            !receipt.lineItems.isEmpty
+            && discount != 0
+            && expectedNet > 0
+            && !candidateMatches(expectedFromItems)
+            && candidateMatches(expectedNet)
+            && fmDiffers(from: expectedNet)
+
+        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount || wholeDollarLarge || totalEqualsItemPrice || betterArithmeticCandidate || itemsAreNet else { return receipt }
 
         // Filter to plausible values. Both a lower AND upper bound
         // relative to items_sum:
@@ -3633,6 +3723,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let sortedVals = plausible.map(\.value).sorted()
         let candidateMedian = sortedVals[sortedVals.count / 2]
         let target: Decimal = {
+            // Net-items receipts: the discount double-counts, so aim at
+            // itemsSum + tax (what the items actually add up to) rather
+            // than `expected`, which re-subtracts the informational
+            // savings and would steer toward the wrong candidate.
+            if itemsAreNet { return expectedNet }
             if expected > 0 { return expected }
             if itemsSum > 0 { return max(itemsSum + taxSum, candidateMedian) }
             return candidateMedian
@@ -3679,6 +3774,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
 
         receipt.totals.total = best.value
         receipt.provenance.fieldConfidence["totals.total"] = 0.7
+        // When we re-anchored because the items are net-of-savings, the
+        // discount field was the informational "Total Savings" figure
+        // and double-counts against the now-correct total. Clear it so
+        // downstream confidence sees itemsSum + tax == total.
+        if itemsAreNet {
+            receipt.totals.discount = nil
+        }
         return receipt
     }
 
@@ -3811,7 +3913,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]{1,2}){0,2}$"#
 
         // Collect every "Regular Price" label Y-center.
         let regularLabels: [Double] = lines.compactMap { line in
@@ -3833,7 +3935,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: "$", with: "")
                 .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
         }
 
@@ -4014,7 +4116,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ) -> Bool {
         guard isDepartmentName(description) else { return false }
         let needle = description.lowercased().trimmingCharacters(in: .whitespaces)
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]{1,2}){0,2}$"#
         func value(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
@@ -4022,7 +4124,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 .replacingOccurrences(of: "$", with: "")
                 .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
         }
         for line in lines {
@@ -4228,7 +4330,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
         guard !rowYs.isEmpty else { return [] }
 
-        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]{1,2}){0,2}$"#
         var out: [Decimal] = []
         for rowY in rowYs {
             // Tight tolerance — we want THIS row's price, not a neighbor's.
@@ -4245,7 +4347,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     .replacingOccurrences(of: "$", with: "")
                     .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
-                    .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+                    .replacingOccurrences(of: #"(?:\s+[A-Z]{1,2})+\s*$"#, with: "", options: .regularExpression)
                 guard let value = Decimal(string: stripped, locale: Locale(identifier: "en_US_POSIX")) else { continue }
                 if best == nil || line.box.x > best!.x {
                     best = (value, line.box.x)
@@ -4551,15 +4653,16 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
     }
 
-    /// Rewrite individual OCR segments that look like `"8.49 S"` or
-    /// `"3.50 T"` (price plus a single trailing tax/SKU letter) to drop
-    /// the letter. We only touch segments that match the strict
-    /// `decimal-then-letter` shape so legitimate item names like
-    /// `"COKE 12 OZ"` are untouched.
+    /// Rewrite individual OCR segments that look like `"8.49 S"`,
+    /// `"3.50 T"`, or `"7.49 FT"` (price plus a trailing tax/SKU marker
+    /// of one or two letters) to drop the marker. We only touch segments
+    /// that match the strict `decimal-then-letters` shape so legitimate
+    /// item names like `"COKE 12 OZ"` are untouched. Two-letter markers
+    /// cover Whole Foods' combined categories ("FT" = Food+Taxable).
     fileprivate static func stripTrailingTaxMarkers(
         _ lines: [(text: String, box: Receipt.BBox)]
     ) -> [(text: String, box: Receipt.BBox)] {
-        let pattern = #"^(-?\$?\d{1,5}(?:[.,]\d{1,2})?)(?:\s+([A-Z]))+\s*$"#
+        let pattern = #"^(-?\$?\d{1,5}(?:[.,]\d{1,2})?)(?:\s+([A-Z]{1,2}))+\s*$"#
         let regex = try? NSRegularExpression(pattern: pattern)
         return lines.map { line in
             guard let regex else { return line }
