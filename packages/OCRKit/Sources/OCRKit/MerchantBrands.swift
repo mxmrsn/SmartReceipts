@@ -140,6 +140,16 @@ public enum MerchantBrands {
         // E-commerce
         ("amazon.com",            "Amazon"),
         ("amazon",                "Amazon"),
+
+        // Asian groceries
+        ("h mart",                "H Mart"),
+        ("hmart",                 "H Mart"),
+        // LAST RESORT: H Mart's logo renders the "H" as graphic art, so
+        // OCR often reads only "MART". Word-bounded matching keeps this
+        // from hitting WALMART or MARKET, and every specific chain above
+        // (walmart, wal-mart, world market variants) matches first
+        // because the table is scanned in order.
+        ("mart",                  "H Mart"),
     ]
 
     /// Cities / suburbs that frequently appear at the top of receipts —

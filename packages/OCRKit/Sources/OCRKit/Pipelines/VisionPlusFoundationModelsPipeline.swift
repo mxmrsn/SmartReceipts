@@ -775,7 +775,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ) -> Receipt {
         var receipt = input
         let total = receipt.totals.total
-        guard total > 0, receipt.lineItems.count >= 2 else { return receipt }
+        guard total > 0, !receipt.lineItems.isEmpty else { return receipt }
 
         let tax = receipt.totals.tax.first?.amount ?? 0
         let tip = receipt.totals.tip ?? 0
@@ -783,70 +783,79 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // Prefer the printed subtotal as the items target; it's the
         // direct checksum. Guard against degenerate subtotals (≤ 0,
         // or ≥ total with tax present).
-        let target: Decimal = {
-            if let s = receipt.totals.subtotal, s > 0, s <= total { return s }
-            return total - tax - tip + discount
-        }()
-        guard target > 0 else { return receipt }
+        var targets: [Decimal] = []
+        if let s = receipt.totals.subtotal, s > 0, s <= total { targets.append(s) }
+        let arithmeticTarget = total - tax - tip + discount
+        if arithmeticTarget > 0, !targets.contains(arithmeticTarget) {
+            targets.append(arithmeticTarget)
+        }
+        guard !targets.isEmpty else { return receipt }
 
         let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
-        let delta = itemsSum - target
         let tol = Decimal(0.011)
-        let absDelta = delta < 0 ? -delta : delta
-        // Already balanced, or so far off that a single move can't be
-        // trusted to explain it.
-        guard absDelta > tol else { return receipt }
-
         func approx(_ a: Decimal, _ b: Decimal) -> Bool {
             let d = a - b
             return d < tol && d > -tol
         }
 
-        if delta > 0 {
-            // OVER: drop the unique item whose price equals the excess.
-            let matches = receipt.lineItems.enumerated().filter { approx($0.element.totalPrice, delta) }
-            if matches.count == 1 {
-                receipt.lineItems.remove(at: matches[0].offset)
+        // Attempt the single-move repair against EACH target in turn and
+        // keep the first that lands. Trying both targets matters when a
+        // surcharge sits between subtotal and total (TASSI: item $2,160
+        // + surcharge $64.80 = total $2,224.80 — only the total-based
+        // target exposes the missing $2,160 line).
+        for target in targets {
+            let delta = itemsSum - target
+            let absDelta = delta < 0 ? -delta : delta
+            if absDelta <= tol { return receipt }   // books already balance
+
+            if delta > 0 {
+                // OVER: drop the unique item whose price equals the excess.
+                let matches = receipt.lineItems.enumerated().filter { approx($0.element.totalPrice, delta) }
+                if matches.count == 1 {
+                    receipt.lineItems.remove(at: matches[0].offset)
+                    return receipt
+                }
+                continue
             }
+
+            // UNDER: re-admit the unique rejected price point whose value
+            // equals the shortfall. Dedupe rejects by (value, centerY) —
+            // the same point can be rejected at multiple gates.
+            let needed = -delta
+            var seen = Set<String>()
+            let candidates = rejects.filter { rp in
+                guard rp.value > 0, approx(rp.value, needed) else { return false }
+                let key = "\(rp.value)@\(Int((rp.centerY * 1000).rounded()))"
+                return seen.insert(key).inserted
+            }
+            guard candidates.count == 1, let point = candidates.first else { continue }
+
+            // Nearest non-price text to the left for the description.
+            let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]){0,2}$"#
+            var bestDesc: (text: String, dy: Double)? = nil
+            for line in lines {
+                let cy = line.box.y + line.box.height / 2
+                let dy = abs(cy - point.centerY)
+                guard dy <= max(0.012, point.box.height * 2.0) else { continue }
+                guard line.box.x < point.box.x else { continue }
+                let t = line.text.trimmingCharacters(in: .whitespaces)
+                guard t.count >= 3 else { continue }
+                if t.range(of: priceShape, options: .regularExpression) != nil { continue }
+                if bestDesc == nil || dy < bestDesc!.dy {
+                    bestDesc = (t, dy)
+                }
+            }
+            guard let desc = bestDesc.map({ Self.cleanLineItemDescription($0.text) }),
+                  desc.count >= 3 else { continue }
+            receipt.lineItems.append(Receipt.LineItem(
+                description: desc,
+                quantity: nil,
+                unitPrice: nil,
+                totalPrice: point.value,
+                category: nil
+            ))
             return receipt
         }
-
-        // UNDER: re-admit the unique rejected price point whose value
-        // equals the shortfall. Dedupe rejects by (value, centerY) —
-        // the same point can be rejected at multiple gates.
-        let needed = -delta
-        var seen = Set<String>()
-        let candidates = rejects.filter { rp in
-            guard rp.value > 0, approx(rp.value, needed) else { return false }
-            let key = "\(rp.value)@\(Int((rp.centerY * 1000).rounded()))"
-            return seen.insert(key).inserted
-        }
-        guard candidates.count == 1, let point = candidates.first else { return receipt }
-
-        // Nearest non-price text to the left for the description.
-        let priceShape = #"^-?\$?-?\d{1,5}[.,]\d{1,2}(?:\s+[A-Z]){0,2}$"#
-        var bestDesc: (text: String, dy: Double)? = nil
-        for line in lines {
-            let cy = line.box.y + line.box.height / 2
-            let dy = abs(cy - point.centerY)
-            guard dy <= max(0.012, point.box.height * 2.0) else { continue }
-            guard line.box.x < point.box.x else { continue }
-            let t = line.text.trimmingCharacters(in: .whitespaces)
-            guard t.count >= 3 else { continue }
-            if t.range(of: priceShape, options: .regularExpression) != nil { continue }
-            if bestDesc == nil || dy < bestDesc!.dy {
-                bestDesc = (t, dy)
-            }
-        }
-        guard let desc = bestDesc.map({ Self.cleanLineItemDescription($0.text) }),
-              desc.count >= 3 else { return receipt }
-        receipt.lineItems.append(Receipt.LineItem(
-            description: desc,
-            quantity: nil,
-            unitPrice: nil,
-            totalPrice: point.value,
-            category: nil
-        ))
         return receipt
     }
 
@@ -1723,6 +1732,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             // digit-hyphen-digit so we don't accidentally rewrite real
             // hyphens elsewhere (e.g. "sub-total").
             let dotted = line.text
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(
                     of: #"(\d)-(\d)"#,
@@ -1810,14 +1820,15 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     ) -> Receipt.BBox? {
         let amountStr = NSDecimalNumber(decimal: amount).stringValue
         let keywords = keywords.map { $0.lowercased() }
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?$"#
 
         // Comma-vs-dot tolerant substring match. Receipts in regions that
         // use "," as the decimal separator ("4,00") wouldn't otherwise
         // match FM's normalized "4.00" output.
         func lineContainsAmount(_ text: String) -> Bool {
             if text.contains(amountStr) { return true }
-            return text.replacingOccurrences(of: ",", with: ".").contains(amountStr)
+            return text.replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".").contains(amountStr)
         }
         func lineContainsKeyword(_ lc: String) -> Bool {
             keywords.contains { lc.contains($0) }
@@ -2024,7 +2035,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // price and inflates items_sum (IMG_2460 Safeway "$79 ADOBO"
         // is really $2.79). Real whole-dollar amounts are rare
         // enough that this trade-off pays off across the sample.
-        let priceShape = #"^-?\$?-?\d{1,5}[.,]\d{1,2}(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]){0,2}$"#
 
         // Step 1: every price-shaped observation with its value.
         // Also flag whether the observation carried a tax-category
@@ -2049,6 +2060,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
             let normalized = trimmed
                 .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
             guard let v = Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX")) else { continue }
@@ -2284,7 +2296,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 let dupesAbove = inColumn.filter {
                     $0.value == p.value && $0.centerY < totalsBlockY - 0.002
                 }.count
-                if dupesAbove < 2 { dbg("SKIP totals-value v=\(p.value)"); continue }
+                // Require OTHER price values above too: a single-item
+                // receipt echoes its lone price through Items Subtotal /
+                // Subtotal rows (Hashi: 0.24 × 3) — those echoes are NOT
+                // items. Two same-priced sandwiches on a multi-price
+                // receipt (La Baguette) still qualify.
+                let distinctAbove = Set(inColumn.filter {
+                    $0.centerY < totalsBlockY - 0.002
+                }.map(\.value)).count
+                if dupesAbove < 2 || distinctAbove < 2 {
+                    dbg("SKIP totals-value v=\(p.value)"); continue
+                }
             }
             // Filter: adjacent to a regular-price / member-savings label.
             if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { dbg("SKIP label-adj v=\(p.value)"); reject(p); continue }
@@ -2455,7 +2477,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
 
         // Compute the price column from prices already matched to OCR.
         // Claim ONE OCR observation per extracted item. The set
@@ -2482,7 +2504,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 // (NSDecimalNumber(decimal: 8.20).stringValue).
                 let normalized = trimmed
                     .replacingOccurrences(of: "$", with: "")
-                    .replacingOccurrences(of: ",", with: ".")
+                    .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
                     .replacingOccurrences(
                         of: #"(\d)-(\d)"#,
                         with: "$1.$2",
@@ -2582,6 +2605,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
             let normalized = trimmed
                 .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
             // Don't promote a totals-block value.
@@ -2703,13 +2727,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
 
         func priceValue(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
             let normalized = trimmed
                 .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
@@ -3066,12 +3091,13 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let expected: Decimal = itemsSum + taxSum + tip - discount
 
         // Does FM's total actually appear anywhere in the OCR?
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
         func priceValue(_ text: String) -> Decimal? {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
             let normalized = trimmed
                 .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
@@ -3156,7 +3182,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             && receipt.lineItems.contains { $0.totalPrice == fmTotal }
             && itemsSum > fmTotal
 
-        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount || wholeDollarLarge || totalEqualsItemPrice else { return receipt }
+        // NOTE: candidates are gathered BEFORE the flag guard because
+        // Flag 7 needs them: a label-anchored value matching the items
+        // checksum exactly, while FM's total doesn't, is conclusive on
+        // its own (IMG_8572: BALANCE 14.97 == items sum, FM said 7.98 —
+        // the savings-block total at 1.88×, under the 2× confusion
+        // gate; IMG_6301: TOTAL 0.24 == items, FM took Cash $20.00).
 
         // Gather grand-total candidates: any price observation on a row
         // whose text starts with a "grand-total" keyword. We accept
@@ -3278,6 +3309,26 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
         guard !candidates.isEmpty else { return receipt }
 
+        // Flag 7: a label-anchored candidate agrees with the items
+        // checksum to the cent while FM's total doesn't. Arithmetic
+        // corroboration from two independent sources (price column +
+        // totals label) beats FM's field choice. Requires ≥ 2 items so
+        // a single mis-extracted item can't force a re-anchor.
+        let expectedFromItems = itemsSum + taxSum + tip - discount
+        let betterArithmeticCandidate =
+            !receipt.lineItems.isEmpty
+            && expectedFromItems > 0
+            && candidates.contains { c in
+                let d = c.value - expectedFromItems
+                return d < Decimal(0.02) && d > Decimal(-0.02)
+            }
+            && {
+                let d = fmTotal - expectedFromItems
+                return d > Decimal(0.02) || d < Decimal(-0.02)
+            }()
+
+        guard hallucinated || savingsBlockConfusion || implausiblyLarge || looksLikeItemCount || wholeDollarLarge || totalEqualsItemPrice || betterArithmeticCandidate else { return receipt }
+
         // Filter to plausible values. Both a lower AND upper bound
         // relative to items_sum:
         //   * Lower bound of items_sum × 0.3 — the real total is
@@ -3347,7 +3398,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         //     run misread). Always replace with something reasonable.
         //   * Otherwise — require the replacement to beat FM on
         //     arithmetic fit. Not currently reachable but future-proof.
-        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge && !looksLikeItemCount && !wholeDollarLarge && !totalEqualsItemPrice {
+        if !hallucinated && !savingsBlockConfusion && !implausiblyLarge && !looksLikeItemCount && !wholeDollarLarge && !totalEqualsItemPrice && !betterArithmeticCandidate {
             let fmDiff = fmTotal > target ? fmTotal - target : target - fmTotal
             let newDiff = best.value > target ? best.value - target : target - best.value
             guard newDiff < fmDiff else { return receipt }
@@ -3405,7 +3456,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                   m.numberOfRanges >= 2,
                   let captureRange = Range(m.range(at: 1), in: text)
             else { return nil }
-            let raw = String(text[captureRange]).replacingOccurrences(of: ",", with: ".")
+            let raw = String(text[captureRange]).replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
             return Decimal(string: raw, locale: Locale(identifier: "en_US_POSIX"))
         }
 
@@ -3486,7 +3538,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         lines: [(text: String, box: Receipt.BBox)]
     ) -> Receipt {
         var receipt = input
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
 
         // Collect every "Regular Price" label Y-center.
         let regularLabels: [Double] = lines.compactMap { line in
@@ -3506,6 +3558,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
             let normalized = trimmed
                 .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
                 .replacingOccurrences(of: ",", with: ".")
                 .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
             return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
@@ -3612,7 +3665,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             if first == kw { return true }
             // Allow "0.70 TAX" — numeric first, keyword second. Use Double
             // to accept both "0.70" and "0,70" (after a comma→dot pass).
-            if Double(first.replacingOccurrences(of: ",", with: ".")) != nil,
+            if Double(first.replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")) != nil,
                tokens.dropFirst().first == kw
             {
                 return true
@@ -3750,6 +3804,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             "grocery rewards", "rewards earned", "points earned",
             "loyalty discount",
             "sale price",
+            "item discount",
+            "total discount",
         ]
         for sub in nonItemSubstrings {
             if lc.contains(sub) { return true }
@@ -3848,7 +3904,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         }
         guard !rowYs.isEmpty else { return [] }
 
-        let priceShape = #"^-?\$?-?\d{1,5}(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})?(?:\s+[A-Z]){0,2}$"#
         var out: [Decimal] = []
         for rowY in rowYs {
             // Tight tolerance — we want THIS row's price, not a neighbor's.
@@ -3863,7 +3919,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { continue }
                 let stripped = trimmed
                     .replacingOccurrences(of: "$", with: "")
-                    .replacingOccurrences(of: ",", with: ".")
+                    .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
                     .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
                 guard let value = Decimal(string: stripped, locale: Locale(identifier: "en_US_POSIX")) else { continue }
                 if best == nil || line.box.x > best!.x {
@@ -4152,8 +4209,10 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                    let g1 = Range(m.range(at: 1), in: text),
                    let g2 = Range(m.range(at: 2), in: text)
                 {
-                    let v1 = String(text[g1]).replacingOccurrences(of: ",", with: ".")
-                    let v2 = String(text[g2]).replacingOccurrences(of: ",", with: ".")
+                    let v1 = String(text[g1]).replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
+                    let v2 = String(text[g2]).replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
                     // Only rewrite when the two stripped values match —
                     // that's the specific "same price twice" pattern
                     // (SALE == REG on a non-discounted item). Different
@@ -4266,6 +4325,8 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         "loyalty discount",
         "sale price",
         "reg price",
+        "item discount",
+        "total discount",
     ]
 
     private static func fuzzyMatchesMetadata(_ lc: String) -> Bool {

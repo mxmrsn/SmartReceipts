@@ -252,10 +252,13 @@
     <h1>Smart Receipts <span class="dot">·</span> Insights</h1>
     <div class="sub" id="subtitle">Loading…</div>
   </div>
-  <div class="toggle" id="viewToggle">
-    <button data-view="week">Weekly</button>
-    <button data-view="month" class="active">Monthly</button>
-    <button data-view="year">Yearly</button>
+  <div style="display:flex;flex-direction:column;align-items:flex-end;gap:8px;">
+    <div class="toggle" id="viewToggle">
+      <button data-view="week">Weekly</button>
+      <button data-view="month" class="active">Monthly</button>
+      <button data-view="year">Yearly</button>
+    </div>
+    <div class="toggle" id="yearChips" style="display:none;"></div>
   </div>
 </div>
 
@@ -289,6 +292,34 @@
     <h3>Spend by Sector</h3>
     <svg id="chartSector" viewBox="0 0 300 220"></svg>
     <div id="sectorLegend" class="legend"></div>
+  </div>
+
+  <div class="panel c-6" id="topPurchasesPanel" style="display:none">
+    <h3>Top Purchases <span class="helper" id="topPurchasesScope"></span></h3>
+    <div class="scrollable" style="max-height:320px;">
+      <table id="tableTopPurchases">
+        <thead><tr>
+          <th>Date</th>
+          <th>Merchant</th>
+          <th class="num">Total</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+  <div class="panel c-6" id="recurringPanel" style="display:none">
+    <h3>Recurring Big-Ticket <span class="helper">≥ 3 visits, by avg receipt</span></h3>
+    <div class="scrollable" style="max-height:320px;">
+      <table id="tableRecurring">
+        <thead><tr>
+          <th>Merchant</th>
+          <th class="num">Visits</th>
+          <th class="num">Avg</th>
+          <th class="num">Total</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="panel c-6">
@@ -425,12 +456,21 @@ const allData = RAW_DATA;
 const data = allData.filter(r => r.confidence >= CONF_FLOOR);
 const lowConfExcluded = allData.length - data.length;
 
+// Year scoping: on the Yearly view, chips let the user drill into a
+// single year — every panel then computes from that year only, and
+// the trend chart drops to monthly granularity within it.
+let selectedYear = null;
+function viewData() {
+  return selectedYear ? data.filter(r => r.date.startsWith(selectedYear)) : data;
+}
+
 // Global stats.
 function updateStats() {
   // Spend figures come from TRUSTED receipts only; confidence stats
   // describe the whole corpus so extraction quality stays honest.
-  const total = data.reduce((s, r) => s + r.total, 0);
-  const count = data.length;
+  const scoped = viewData();
+  const total = scoped.reduce((s, r) => s + r.total, 0);
+  const count = scoped.length;
   const avg = count ? total / count : 0;
   const confAll = allData.length
     ? allData.reduce((s, r) => s + r.confidence, 0) / allData.length : 0;
@@ -443,32 +483,34 @@ function updateStats() {
   document.getElementById('statConfHelper').textContent =
     `${hi} of ${allData.length} at ≥ 0.85 · ${lowConfExcluded} below ${CONF_FLOOR} excluded from trends`;
 
-  const dates = data.map(r => r.date).filter(Boolean).sort();
+  const dates = scoped.map(r => r.date).filter(Boolean).sort();
   if (dates.length) {
     document.getElementById('statTotalHelper').textContent =
       `${dates[0]} → ${dates[dates.length - 1]} · trusted receipts only`;
     document.getElementById('statCountHelper').textContent =
-      `${new Set(data.map(r => r.merchant)).size} unique merchants · ${lowConfExcluded} low-conf excluded`;
+      `${new Set(scoped.map(r => r.merchant)).size} unique merchants · ${lowConfExcluded} low-conf excluded`;
   }
 
   document.getElementById('subtitle').textContent =
+    (selectedYear ? `${selectedYear} · ` : '') +
     `${count} of ${allData.length} receipts in trends (${lowConfExcluded} low-confidence excluded) · ` +
-    `${new Set(data.map(r => r.merchant)).size} merchants · avg confidence ${(confAll * 100).toFixed(0)}%`;
+    `${new Set(scoped.map(r => r.merchant)).size} merchants · avg confidence ${(confAll * 100).toFixed(0)}%`;
 }
 
 // Spending trend chart.
 function renderTrend() {
   const svg = document.getElementById('chartTrend');
   svg.innerHTML = '';
-  if (!data.length) {
+  const effView = (currentView === 'year' && selectedYear) ? 'month' : currentView;
+  if (!viewData().length) {
     svg.insertAdjacentHTML('beforeend', '<text x="400" y="130" text-anchor="middle" class="axis-text">No data yet</text>');
     return;
   }
 
   const buckets = new Map();
-  for (const r of data) {
+  for (const r of viewData()) {
     if (!r.date) continue;
-    const k = bucketKey(r.date, currentView);
+    const k = bucketKey(r.date, effView);
     buckets.set(k, (buckets.get(k) || 0) + r.total);
   }
   const keys = [...buckets.keys()].sort();
@@ -515,7 +557,7 @@ function renderTrend() {
   for (let i = 0; i < points.length; i++) {
     const [x, y] = points[i];
     svg.insertAdjacentHTML('beforeend', `<circle class="dot" cx="${x}" cy="${y}" r="3">
-      <title>${bucketLabel(keys[i], currentView)}: ${fmtMoney(vals[i])}</title>
+      <title>${bucketLabel(keys[i], effView)}: ${fmtMoney(vals[i])}</title>
     </circle>`);
   }
 
@@ -524,7 +566,7 @@ function renderTrend() {
   for (let i = 0; i < keys.length; i += step2) {
     const x = padL + i * step;
     svg.insertAdjacentHTML('beforeend',
-      `<text class="axis-text" x="${x}" y="${H - 6}" text-anchor="middle">${bucketLabel(keys[i], currentView)}</text>`
+      `<text class="axis-text" x="${x}" y="${H - 6}" text-anchor="middle">${bucketLabel(keys[i], effView)}</text>`
     );
   }
 }
@@ -537,7 +579,7 @@ function renderSector() {
   legend.innerHTML = '';
 
   const totals = new Map();
-  for (const r of data) {
+  for (const r of viewData()) {
     totals.set(r.sector, (totals.get(r.sector) || 0) + r.total);
   }
   const items = SECTOR_ORDER
@@ -587,7 +629,7 @@ function renderMerchants() {
   const tbody = document.querySelector('#tableMerchants tbody');
   tbody.innerHTML = '';
   const byMerchant = new Map();
-  for (const r of data) {
+  for (const r of viewData()) {
     const m = byMerchant.get(r.merchant) || {spend: 0, visits: 0};
     m.spend += r.total;
     m.visits += 1;
@@ -616,7 +658,7 @@ function renderMerchants() {
 // ----- Merchant detail: top purchased items + per-item price history -----
 function merchantItemIndex(merchant) {
   const idx = new Map(); // normalized desc → {label, entries: [{date, price, merchant}]}
-  for (const r of data) {
+  for (const r of viewData()) {
     if (r.merchant !== merchant || !r.date) continue;
     for (const it of r.items) {
       const key = normalizeDesc(it.desc);
@@ -655,7 +697,7 @@ function selectMerchant(name) {
   selectedMerchant = name;
   renderMerchants();
 
-  const visits = data.filter(r => r.merchant === name);
+  const visits = viewData().filter(r => r.merchant === name);
   const spend = visits.reduce((s, r) => s + r.total, 0);
   document.getElementById('mdName').textContent = name;
   document.getElementById('mdStats').textContent =
@@ -747,7 +789,7 @@ const NOISE_PATTERNS = [
 
 function buildProductIndex() {
   const idx = new Map(); // desc → [{date, price, merchant, receipt}]
-  for (const r of data) {
+  for (const r of viewData()) {
     for (const it of r.items) {
       const key = normalizeDesc(it.desc);
       if (!key) continue;
@@ -892,13 +934,77 @@ function renderProduct(key, repeats) {
   drawPriceTimeChart(svg, meta, entry[1], 220);
 }
 
+// ----- Top purchases / recurring big-ticket (Yearly view) -----
+function renderTopPurchases() {
+  const show = currentView === 'year';
+  document.getElementById('topPurchasesPanel').style.display = show ? '' : 'none';
+  document.getElementById('recurringPanel').style.display = show ? '' : 'none';
+  if (!show) return;
+  const scoped = viewData();
+  document.getElementById('topPurchasesScope').textContent =
+    selectedYear ? `most expensive receipts of ${selectedYear}` : 'most expensive receipts, all years';
+
+  const tp = document.querySelector('#tableTopPurchases tbody');
+  tp.innerHTML = '';
+  for (const r of [...scoped].sort((a, b) => b.total - a.total).slice(0, 10)) {
+    tp.insertAdjacentHTML('beforeend', `<tr>
+      <td class="dim">${r.date}</td>
+      <td>${r.merchant}</td>
+      <td class="num">${fmtMoney(r.total)}</td>
+    </tr>`);
+  }
+  if (!scoped.length) tp.innerHTML = '<tr><td colspan="3" class="empty">No receipts in scope.</td></tr>';
+
+  const byM = new Map();
+  for (const r of scoped) {
+    const m = byM.get(r.merchant) || {visits: 0, spend: 0};
+    m.visits += 1; m.spend += r.total;
+    byM.set(r.merchant, m);
+  }
+  const rec = document.querySelector('#tableRecurring tbody');
+  rec.innerHTML = '';
+  const rows = [...byM.entries()]
+    .map(([name, x]) => ({name, ...x, avg: x.spend / x.visits}))
+    .filter(x => x.visits >= 3)
+    .sort((a, b) => b.avg - a.avg)
+    .slice(0, 10);
+  for (const row of rows) {
+    rec.insertAdjacentHTML('beforeend', `<tr>
+      <td>${row.name}</td>
+      <td class="num dim">${row.visits}</td>
+      <td class="num">${fmtMoney(row.avg)}</td>
+      <td class="num dim">${fmtMoney(row.spend)}</td>
+    </tr>`);
+  }
+  if (!rows.length) rec.innerHTML = '<tr><td colspan="4" class="empty">No recurring merchants in scope.</td></tr>';
+}
+
+// ----- Year chips (Yearly view drill-down) -----
+function renderYearChips() {
+  const box = document.getElementById('yearChips');
+  box.innerHTML = '';
+  if (currentView !== 'year') { box.style.display = 'none'; return; }
+  const years = [...new Set(data.map(r => r.date.slice(0, 4)))].sort();
+  const mk = (label, value) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if ((value === null && selectedYear === null) || value === selectedYear) b.className = 'active';
+    b.addEventListener('click', () => { selectedYear = value; render(); });
+    return b;
+  };
+  box.appendChild(mk('All years', null));
+  for (const y of years) box.appendChild(mk(y, y));
+  box.style.display = '';
+}
+
 // ----- View toggle wiring -----
 document.querySelectorAll('#viewToggle button').forEach(btn => {
   btn.addEventListener('click', () => {
     document.querySelectorAll('#viewToggle button').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     currentView = btn.dataset.view;
-    renderTrend();
+    if (currentView !== 'year') selectedYear = null;
+    render();
   });
 });
 
@@ -912,7 +1018,7 @@ function renderDow() {
   const dowNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
   const counts = [0, 0, 0, 0, 0, 0, 0];
   const spend = [0, 0, 0, 0, 0, 0, 0];
-  for (const r of data) {
+  for (const r of viewData()) {
     const d = parseDate(r.date);
     if (isNaN(d.getTime())) continue;
     counts[d.getDay()]++;
@@ -953,6 +1059,8 @@ function renderDow() {
 
 // ----- Boot -----
 function render() {
+  renderYearChips();
+  renderTopPurchases();
   updateStats();
   renderTrend();
   renderSector();

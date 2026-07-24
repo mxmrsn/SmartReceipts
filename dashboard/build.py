@@ -39,6 +39,8 @@ SECTOR_RULES = [
     ("costco",             "Groceries"),
     ("oriental",           "Groceries"),
     ("hashi",              "Groceries"),
+    ("h mart",             "Groceries"),
+    ("hmart",              "Groceries"),
     ("kroger",             "Groceries"),
     ("albertsons",         "Groceries"),
     ("lucky",              "Groceries"),
@@ -79,6 +81,8 @@ def sector_for(merchant: str) -> str:
     if not merchant:
         return "Other"
     lo = merchant.lower()
+    if re.sub(r"[^a-z]", "", lo) in ("mart", "hmart"):
+        return "Groceries"
     for needle, sector in SECTOR_RULES:
         if needle in lo:
             return sector
@@ -91,6 +95,11 @@ def merchant_canonical(name: str) -> str:
     if not name:
         return "Unknown"
     lo = name.lower().strip()
+    # H Mart's stylized logo OCRs as bare "MART" / "MART®" / "MART°" —
+    # the H is graphic art, not text. Consolidate those under H Mart
+    # (real Walmart / World Market names never reduce to bare "mart").
+    if re.sub(r"[^a-z]", "", lo) in ("mart", "hmart"):
+        return "H Mart"
     for needle, _ in SECTOR_RULES:
         if needle in lo:
             # Title-case the needle for a clean label.
