@@ -1,6 +1,66 @@
 # Hard-to-parse receipts
 
-## Current state (2026-07-23, after checksum-anchored-totals batch)
+## Current state (2026-07-24, after column-election + net-items batch)
+
+1,183/1,183 extract, zero failures. **962 high (>= 0.85) - 166 medium
+- 55 low.** Avg confidence 0.913. Day's arc this session: 877/228/78
+-> 962/166/55, avg 0.885 -> 0.913.
+
+Seven systematic fixes this session, each traced to a real receipt and
+verified against the ground-truth photo, zero regressions across the
+guard set:
+1. Checksum + tax-marker COLUMN ELECTION — Safeway's two-column
+   "Price | You Pay" layout now elects the paid column by matching a
+   printed BALANCE/PAYMENT AMOUNT (± tax) to the cent, or by tax-marker
+   density (IMG_6463 0.45 -> 0.97, IMG_5026 -> 1.00).
+2. Two-letter tax markers ("FT" = WFM Food+Taxable) + net-of-savings
+   re-anchoring (Whole Foods cluster IMG_8129/8253/6497/6580/6305 ->
+   1.00; items are already net, discount was informational).
+3. Drop informational discount LINE ITEMS (Old Navy net price + "Item
+   Discount" breakdown; IMG_2107/7341 -> 1.00).
+4. Impossible-tip guard (handwritten Clover tip "$7.00" OCR'd as "700";
+   IMG_5130 -> 1.00).
+5. Negative-tax drop + flipped-receipt totals-boundary guard.
+6. Net-sales / total-taxes / taxable-amount non-item filter.
+7. Unit+extended duplicate dedup (same value, one row, two X columns;
+   Ace IMG_3658 0.30 -> 1.00).
+
+### Remaining 55 low — the documented floor (37 under / 13 over / 5 zero)
+
+**Genuine OCR under-extraction (37).** Confirmed by pulling the photos:
+Vision does not emit price tokens for many items on crumpled / faded /
+long thermal receipts. The 2x tiled re-scan already runs and cannot
+recover text the sensor did not capture. Examples: Trader Joe's IMG_7345
+(creases fragment 7 of 16 prices: "$11.46"->"46", "$9.23"->"$9"),
+Grocery Outlet (5), Target long receipts (IMG_3060), Hashi, Sprouts.
+Not fixable at the parse layer — needs better input.
+
+**Diverse over-extraction (13), causes identified but each risky to fix:**
+- Safeway ceiling-circle (IMG_6003): bogus FM total $3.99 makes the
+  price-ceiling kill the $4.49 item; real total $16.11 prints twice.
+- Safeway coupon-as-negative (IMG_4084): a real -$5.00 coupon is filtered
+  as savings-metadata; keeping it (34.49 - 5 = 29.49) would reconcile,
+  but that inverts the per-item "Member Savings" filtering we rely on
+  elsewhere. Needs checksum-gated disambiguation — high regression risk.
+- Safeway stacked regular/paid at same X (IMG_4084/7603): same value
+  printed twice vertically (no discount, regular==paid); dedup requires
+  a horizontal gap to avoid merging genuine same-priced stacked items.
+- Restaurant qty (In-N-Out IMG_2035): "2 Hamburger" quantity misread.
+- Oriental Grocery / Hashi two-column variants (IMG_6857/6642/7849):
+  non-Safeway two-column layouts the election doesn't cover.
+- Taco Mana IMG_1531 (2.9x): FM output triples items (malformed JSON).
+
+**Zero-total (5), all correct or harmless:** IMG_6643 unreadable,
+IMG_3557/8304 USPS/USPS $0 label receipts (correctly $0, excluded from
+dollar charts), IMG_2562/6630 cut-off framing.
+
+**Persistent one-offs:** TASSI IMG_5265 (items understate; total correct),
+La Baguette IMG_2169 (x2), Mens Wearhouse IMG_1561 (return sign),
+IMG_8245 Whole Foods 180-flip (descriptions mirror to the RIGHT of
+prices — full orientation-mirroring is disproportionate risk for the
+handful of flipped photos).
+
+## Previous state (2026-07-23, after checksum-anchored-totals batch)
 
 1,183/1,183 extract, zero failures (1,424 s wall, 6 workers).
 **877 high (>= 0.85) - 228 medium - 78 low.** Avg confidence 0.885.
