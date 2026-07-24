@@ -892,6 +892,19 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         if receipt.totals.tax.count != before {
             receipt.provenance.fieldConfidence["totals.tax"] = 0.3
         }
+        // A tip larger than the entire bill is impossible. On Clover-style
+        // restaurant slips the tip is HANDWRITTEN ("$7.00") and OCR drops
+        // the decimal ("700"); that phantom tip then poisons the items +
+        // tax + tip arithmetic and blocks re-anchoring the total off the
+        // printed pre-tip "Total" (IMG_5129 DOHATSUTEN: tip 700 vs total
+        // 41.03). Clear it so the printed total can reconcile.
+        if let tip = receipt.totals.tip {
+            let ref = max(receipt.totals.total, receipt.totals.subtotal ?? 0)
+            if ref > 0, tip > ref {
+                receipt.totals.tip = nil
+                receipt.provenance.fieldConfidence["totals.tip"] = 0.3
+            }
+        }
         return receipt
     }
 
@@ -950,6 +963,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     private static func reconcileItemsVsTotals(_ input: Receipt) -> Receipt {
         var receipt = input
         let total = receipt.totals.total
+        // A tip larger than the whole bill is impossible — re-drop it
+        // here too, since sanityCheckSubtotalTaxTip may have re-read the
+        // handwritten-tip misfire ("$7.00" → "700") back out of the OCR
+        // after the early dropInvalidTax pass (IMG_5129 DOHATSUTEN).
+        if let tip = receipt.totals.tip {
+            let ref = max(total, receipt.totals.subtotal ?? 0)
+            if ref > 0, tip > ref {
+                receipt.totals.tip = nil
+                receipt.provenance.fieldConfidence["totals.tip"] = 0.3
+            }
+        }
         guard total > 0, !receipt.lineItems.isEmpty else { return receipt }
         let itemsSum: Decimal = receipt.lineItems.reduce(0) { $0 + $1.totalPrice }
         guard itemsSum > 0 else { return receipt }
