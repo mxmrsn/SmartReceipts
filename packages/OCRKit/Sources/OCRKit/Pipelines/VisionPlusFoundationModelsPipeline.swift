@@ -802,14 +802,33 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let tax = receipt.totals.tax.first?.amount ?? 0
         let tip = receipt.totals.tip ?? 0
         let discount = receipt.totals.discount ?? 0
-        // Prefer the printed subtotal as the items target; it's the
-        // direct checksum. Guard against degenerate subtotals (≤ 0,
-        // or ≥ total with tax present).
-        var targets: [Decimal] = []
-        if let s = receipt.totals.subtotal, s > 0, s <= total { targets.append(s) }
+
+        // A checksum target: the value the item list should sum to, plus
+        // the grand total it implies. FM-derived targets leave the total
+        // as-is (impliedTotal == current). PRINTED targets come from the
+        // OCR's own totals labels, independent of FM's field pick, so a
+        // bogus FM total can't block the repair — and when a move lands
+        // on a printed target we re-anchor the total to it.
+        struct BalanceTarget { let items: Decimal; let impliedTotal: Decimal? }
+        var targets: [BalanceTarget] = []
+        if let s = receipt.totals.subtotal, s > 0, s <= total {
+            targets.append(BalanceTarget(items: s, impliedTotal: nil))
+        }
         let arithmeticTarget = total - tax - tip + discount
-        if arithmeticTarget > 0, !targets.contains(arithmeticTarget) {
-            targets.append(arithmeticTarget)
+        if arithmeticTarget > 0 {
+            targets.append(BalanceTarget(items: arithmeticTarget, impliedTotal: nil))
+        }
+        // Printed OCR grand totals (label-anchored), independent of FM's
+        // total: the items should sum to the printed total itself
+        // (untaxed, or tax folded into item rows). We deliberately do
+        // NOT build a `total − tax` items target: with a wrong extracted
+        // tax that would rubber-stamp a short item list as "balanced"
+        // and re-anchor the total to match (IMG_5026: an escalation pass
+        // with a spurious $6.99 tax "balanced" 5 items against $22.94).
+        // Missing tax shows up as an honest gap, not a false 1.00.
+        let ocr = Self.ocrTotalsTargets(lines: lines)
+        for tg in ocr.totals.sorted(by: >) {
+            targets.append(BalanceTarget(items: tg, impliedTotal: tg))
         }
         guard !targets.isEmpty else { return receipt }
 
@@ -819,22 +838,71 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             let d = a - b
             return d < tol && d > -tol
         }
+        // Never disturb a list that already reconciles against the
+        // receipt's OWN arithmetic (items + tax + tip − discount ≈
+        // total). Repair moves exist only to fix lists that don't
+        // balance; touching one that does can only break it.
+        if approx(itemsSum + tax + tip - discount, total) { return receipt }
+        // Commit a re-anchor when a printed total target was used.
+        func reanchor(_ t: BalanceTarget) {
+            if let it = t.impliedTotal, !approx(it, receipt.totals.total) {
+                receipt.totals.total = it
+                receipt.provenance.fieldConfidence["totals.total"] = 0.7
+            }
+        }
 
         // Attempt the single-move repair against EACH target in turn and
         // keep the first that lands. Trying both targets matters when a
         // surcharge sits between subtotal and total (TASSI: item $2,160
         // + surcharge $64.80 = total $2,224.80 — only the total-based
         // target exposes the missing $2,160 line).
-        for target in targets {
+        for t in targets {
+            let target = t.items
             let delta = itemsSum - target
             let absDelta = delta < 0 ? -delta : delta
-            if absDelta <= tol { return receipt }   // books already balance
+            if absDelta <= tol {   // books already balance against this target
+                reanchor(t)
+                return receipt
+            }
 
             if delta > 0 {
-                // OVER: drop the unique item whose price equals the excess.
+                // OVER, move (a): drop the unique item whose price equals
+                // the excess.
                 let matches = receipt.lineItems.enumerated().filter { approx($0.element.totalPrice, delta) }
                 if matches.count == 1 {
                     receipt.lineItems.remove(at: matches[0].offset)
+                    reanchor(t)
+                    return receipt
+                }
+                // OVER, move (b): the excess equals a value that appears
+                // 2+ times among items — a regular-price / FM double-emit
+                // duplicate. Drop ONE occurrence. (Two same-priced real
+                // items would also match, but only when their price
+                // happens to equal the exact residual to a printed total,
+                // which is the coincidence the exactness gate accepts.)
+                let dupIdx = receipt.lineItems.enumerated().filter { approx($0.element.totalPrice, delta) }
+                if dupIdx.count >= 2 {
+                    receipt.lineItems.remove(at: dupIdx[0].offset)
+                    reanchor(t)
+                    return receipt
+                }
+                // OVER, move (c): a negative reject (coupon / credit) whose
+                // magnitude equals the excess was filtered out; re-admit it
+                // as a negative line item so the discount is recorded and
+                // the books balance (IMG_4084 Safeway: -$5.00 coupon
+                // filtered as savings-metadata, items 34.49 → 29.49 total).
+                var seenNeg = Set<String>()
+                let negCands = rejects.filter { rp in
+                    guard rp.value < 0, approx(-rp.value, delta) else { return false }
+                    let key = "\(rp.value)@\(Int((rp.centerY * 1000).rounded()))"
+                    return seenNeg.insert(key).inserted
+                }
+                if negCands.count == 1, let np = negCands.first {
+                    receipt.lineItems.append(Receipt.LineItem(
+                        description: "Discount", quantity: nil, unitPrice: nil,
+                        totalPrice: np.value, category: nil
+                    ))
+                    reanchor(t)
                     return receipt
                 }
                 continue
@@ -860,11 +928,11 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 let dy = abs(cy - point.centerY)
                 guard dy <= max(0.012, point.box.height * 2.0) else { continue }
                 guard line.box.x < point.box.x else { continue }
-                let t = line.text.trimmingCharacters(in: .whitespaces)
-                guard t.count >= 3 else { continue }
-                if t.range(of: priceShape, options: .regularExpression) != nil { continue }
+                let txt = line.text.trimmingCharacters(in: .whitespaces)
+                guard txt.count >= 3 else { continue }
+                if txt.range(of: priceShape, options: .regularExpression) != nil { continue }
                 if bestDesc == nil || dy < bestDesc!.dy {
-                    bestDesc = (t, dy)
+                    bestDesc = (txt, dy)
                 }
             }
             guard let desc = bestDesc.map({ Self.cleanLineItemDescription($0.text) }),
@@ -876,6 +944,7 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 totalPrice: point.value,
                 category: nil
             ))
+            reanchor(t)
             return receipt
         }
         return receipt
