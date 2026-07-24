@@ -566,7 +566,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         // negative-value items so items_sum reconciles with total).
         receipt.lineItems.removeAll { item in
             if item.totalPrice < 0 { return false }
-            return Self.looksLikeNonItemRecoveryCandidate(item.description)
+            guard Self.looksLikeNonItemRecoveryCandidate(item.description) else { return false }
+            // Department-keyed ring-ups print the department AS the item
+            // row ("DAIRY  8.99 T F", IMG_3524 Sprouts). The column path
+            // has a same-row exception for these; FM-emitted items need
+            // the same one here or a legitimate one-line ring-up gets
+            // filtered into an empty item list.
+            if Self.departmentRingUpConfirmed(
+                description: item.description,
+                price: item.totalPrice,
+                lines: postLines
+            ) { return false }
+            return true
         }
         // Implausible-price filter: drop items whose price exceeds
         // 3× the receipt total. On Ace Hardware IMG_4359, FM emitted
@@ -1976,6 +1987,74 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         return out
     }
 
+    /// Label-anchored totals and tax values read straight from the OCR,
+    /// independent of FM's (possibly wrong) field picks. The column
+    /// election uses these as checksum targets: a candidate price column
+    /// whose item sum equals a printed BALANCE / PAYMENT AMOUNT — or
+    /// that value minus a printed TAX — is the real paid column.
+    private static func ocrTotalsTargets(
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> (totals: Set<Decimal>, taxes: Set<Decimal>) {
+        let totalKeywords = [
+            "grand total", "balance due", "total due", "amount due",
+            "amount paid", "payment amount", "balance", "total",
+            "subtotal", "sub total", "sub-total",
+        ]
+        let taxKeywords = ["tax", "sales tax"]
+        let countMarkers = [
+            "number of items", "items in transaction",
+            "item count", "items sold", "total items",
+        ]
+        // Cents required: integer tokens near totals labels are usually
+        // item counts, store numbers, or points balances.
+        let valueShape = #"^-?\$?\d{1,3}(?:,\d{3})*[.,]\d{2}$"#
+        func value(_ text: String) -> Decimal? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+            guard trimmed.range(of: valueShape, options: .regularExpression) != nil else { return nil }
+            let normalized = trimmed
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
+            return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
+        }
+        func normalize(_ text: String) -> String {
+            text.lowercased()
+                .replacingOccurrences(of: #"[^a-z0-9 ]"#, with: " ", options: .regularExpression)
+                .replacingOccurrences(of: #" +"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+        }
+
+        var totals: Set<Decimal> = []
+        var taxes: Set<Decimal> = []
+        for (idx, line) in lines.enumerated() {
+            let stripped = normalize(line.text)
+            guard !stripped.isEmpty else { continue }
+            if countMarkers.contains(where: { stripped.contains($0) }) { continue }
+            let isTotal = totalKeywords.contains { stripped == $0 || stripped.hasPrefix($0 + " ") }
+            let isTax = !isTotal && taxKeywords.contains { stripped == $0 || stripped.hasPrefix($0 + " ") }
+            guard isTotal || isTax else { continue }
+            var found: [Decimal] = []
+            // Inline value ("BALANCE 75.78" as one observation).
+            for tok in line.text.split(whereSeparator: { $0.isWhitespace }) {
+                if let v = value(String(tok)), v > 0 { found.append(v) }
+            }
+            // Same-row neighbors — Vision usually splits the label and
+            // its amount into separate observations.
+            let cy = line.box.y + line.box.height / 2
+            let tol = max(0.008, line.box.height * 0.9)
+            for (jdx, other) in lines.enumerated() where jdx != idx {
+                let oy = other.box.y + other.box.height / 2
+                guard abs(oy - cy) <= tol else { continue }
+                if let v = value(other.text), v > 0 { found.append(v) }
+            }
+            for v in found {
+                if isTotal { totals.insert(v) } else { taxes.insert(v) }
+            }
+        }
+        return (totals, taxes)
+    }
+
     /// PRIMARY line-item extraction — walks the price column and emits
     /// a line item for every price observation that isn't a totals
     /// block value, a regular-price amount, or a savings amount.
@@ -2087,48 +2166,9 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         guard pricePoints.count >= 2 else { return ([], []) }
         var rejects: [RejectedPricePoint] = []
 
-        // Step 1b: identify the price column.
-        //
-        // Median X works for most receipts, but Safeway-style chains that
-        // print BOTH a "Regular Price / Member Savings" metadata column
-        // AND a real paid-price column produce a bimodal X distribution
-        // (metadata at x≈0.58, actual prices at x≈0.66 on IMG_1788).
-        // With more metadata rows than real rows (2:1 ratio: each item
-        // has a regular-price + savings sibling), the median lands
-        // BETWEEN the columns and the ±0.05 band excludes the real
-        // prices entirely.
-        //
-        // Detect a bimodal X distribution by scanning sorted X values for
-        // a large gap. If found, prefer the RIGHTMOST cluster — actual
-        // paid prices always print rightmost on a receipt (regulars /
-        // savings values are indented to the left of the paid column).
-        let xs = pricePoints.map(\.box.x).sorted()
-        let medianX: Double = {
-            guard xs.count >= 4 else { return xs[xs.count / 2] }
-            var largestGap: Double = 0
-            var gapIdx = -1
-            for i in 1..<xs.count {
-                let g = xs[i] - xs[i - 1]
-                if g > largestGap { largestGap = g; gapIdx = i }
-            }
-            // A gap of 0.03+ is a real column boundary (thermal-printer
-            // columns are typically ≥ 0.06 apart in normalized coords).
-            if largestGap >= 0.03, gapIdx >= 0 {
-                let rightCluster = Array(xs[gapIdx..<xs.count])
-                // Only use the rightmost cluster if it's got enough
-                // members that it's plausibly the item column — otherwise
-                // a single stray X (rare) would hijack the pick.
-                if rightCluster.count >= 2 {
-                    return rightCluster[rightCluster.count / 2]
-                }
-            }
-            return xs[xs.count / 2]
-        }()
-        let columnLo = max(0.0, medianX - 0.05)
-        let columnHi = medianX + 0.05
-
-        // Step 2: totals-block Y boundary. Anything at or below is
-        // payment / footer noise.
+        // Step 2 (moved before column election — the election's checksum
+        // simulation needs the boundary): totals-block Y. Anything at or
+        // below is payment / footer noise.
         let totalsKeywords: [String] = [
             "subtotal", "sub-total", "tax", "balance", "total",
             "amount due", "amount paid", "payment amount", "tip", "change",
@@ -2164,25 +2204,246 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
             }
         }
 
-        // Step 4 (precompute): Y centers of every regular-price /
-        // member-savings / you-save label observation. Fuzzy-matches
-        // against canonical phrases so OCR typos ("Reguler Price",
-        // "Member Sovings", "Menber Savings") still get flagged as
-        // labels — otherwise column-anchored ends up picking the
-        // metadata values as line items on faded Safeway receipts.
-        let labelYs: [Double] = lines.compactMap { line in
+        // Step 4 (precompute): Y centers of every metadata label
+        // observation, classed by semantics. Fuzzy-matches against
+        // canonical phrases — with a trailing amount stripped first —
+        // so OCR typos ("Reguler Price", "Menber Savings -0.79") still
+        // get flagged; otherwise column-anchored picks the metadata
+        // values (or their text) as line items on faded Safeway
+        // receipts. Savings-class labels poison BOTH signs of adjacent
+        // price (the paid value lives elsewhere); discount-class labels
+        // ("Item Discount") own a legitimate NEGATIVE item amount, so
+        // only positive same-row prices are junk there.
+        // NOTE: registration deliberately does NOT use the amount-
+        // stripped fuzzy match. A merged label ("Member Savings -1.30"
+        // in one observation) carries its value inside its own text —
+        // there is no separate same-row price point to poison, and on
+        // dense three-row Safeway layouts the row pitch is tight enough
+        // that a stripped-match registry started poisoning the PAID
+        // price on the neighboring row (IMG_5046 lost $9 of items).
+        // Merged labels are handled where they actually bite: the
+        // description filter (`looksLikeNonItemRecoveryCandidate`) and
+        // the FM prompt filter (`dropMetadataObservations`).
+        struct MetaLabel { let y: Double; let isSavingsClass: Bool }
+        let metaLabels: [MetaLabel] = lines.compactMap { line in
             let lc = line.text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             guard !lc.isEmpty else { return nil }
-            if lc.count <= 30, fuzzyMatchesMetadata(lc) {
-                return line.box.y + line.box.height / 2
+            let y = line.box.y + line.box.height / 2
+            if lc.count <= 30, fuzzyMatchesAny(lc, phrases: savingsClassPhrases) {
+                return MetaLabel(y: y, isSavingsClass: true)
+            }
+            if lc.count <= 30, fuzzyMatchesAny(lc, phrases: discountClassPhrases) {
+                return MetaLabel(y: y, isSavingsClass: false)
             }
             // Legacy shortcuts for phrases the fuzzy set doesn't cover.
             let extras = ["for personalized", "forl personalized"]
             if extras.contains(where: { lc == $0 || lc.hasPrefix($0 + " ") }) {
-                return line.box.y + line.box.height / 2
+                return MetaLabel(y: y, isSavingsClass: true)
             }
             return nil
         }
+
+        // Step 1b: identify the price column.
+        //
+        // Median X works for most receipts, but Safeway-style chains that
+        // print BOTH a "Regular Price / Member Savings" metadata column
+        // AND a real paid-price column produce a bimodal X distribution
+        // (metadata at x≈0.58, actual prices at x≈0.66 on IMG_1788).
+        // With more metadata rows than real rows (2:1 ratio: each item
+        // has a regular-price + savings sibling), the median lands
+        // BETWEEN the columns and the ±0.05 band excludes the real
+        // prices entirely.
+        //
+        // Legacy heuristic: detect a bimodal X distribution by scanning
+        // sorted X values for the single largest gap and prefer the
+        // RIGHTMOST cluster. That breaks on Safeway's two-column
+        // "Price | You Pay" layout (IMG_6463): the columns sit only
+        // ~0.04 apart while stray left-side points (weights, SKU
+        // fragments) produce a LARGER gap elsewhere, so the merged
+        // right side elects the regular-price column and every
+        // discounted item extracts at its pre-savings price.
+        //
+        // Checksum election, tried first: the receipt itself says which
+        // column is real — the paid column SUMS to a printed totals
+        // value (BALANCE / PAYMENT AMOUNT), optionally plus tax. Split
+        // the X axis into clusters, simulate each cluster's item sum
+        // under the standard filters, and elect the rightmost cluster
+        // whose sum matches a label-anchored totals target to the cent.
+        // Falls back to the legacy pick when nothing matches (missing
+        // rows, misread digits) — no behavior change there.
+        let xs = pricePoints.map(\.box.x).sorted()
+        let legacyMedianX: Double = {
+            guard xs.count >= 4 else { return xs[xs.count / 2] }
+            var largestGap: Double = 0
+            var gapIdx = -1
+            for i in 1..<xs.count {
+                let g = xs[i] - xs[i - 1]
+                if g > largestGap { largestGap = g; gapIdx = i }
+            }
+            // A gap of 0.03+ is a real column boundary (thermal-printer
+            // columns are typically ≥ 0.06 apart in normalized coords).
+            if largestGap >= 0.03, gapIdx >= 0 {
+                let rightCluster = Array(xs[gapIdx..<xs.count])
+                // Only use the rightmost cluster if it's got enough
+                // members that it's plausibly the item column — otherwise
+                // a single stray X (rare) would hijack the pick.
+                if rightCluster.count >= 2 {
+                    return rightCluster[rightCluster.count / 2]
+                }
+            }
+            return xs[xs.count / 2]
+        }()
+
+        let debugCol = ProcessInfo.processInfo.environment["OCR_DEBUG_COL"] != nil
+        func dbg(_ s: String) {
+            if debugCol { FileHandle.standardError.write(Data((s + "\n").utf8)) }
+        }
+
+        // Simulate the item sum a column pick would produce, mirroring
+        // the pair-dedup + totals-block + totals-value (with the
+        // multiplicity exception) + metadata-label filters the real
+        // walk applies below. Also reports how many points survive —
+        // election requires a real column, not two junk values that
+        // happen to add up.
+        func simulateColumn(around columnX: Double) -> (sum: Decimal, survivors: Int) {
+            let lo = max(0.0, columnX - 0.05)
+            let hi = columnX + 0.05
+            let raw = pricePoints
+                .filter { lo <= $0.box.x && $0.box.x <= hi }
+                .sorted { $0.centerY < $1.centerY }
+            var kept: [PricePoint] = []
+            var i = 0
+            while i < raw.count {
+                let cur = raw[i]
+                if i + 1 < raw.count {
+                    let nxt = raw[i + 1]
+                    let sameSign = (cur.value > 0 && nxt.value > 0) || (cur.value < 0 && nxt.value < 0)
+                    if abs(nxt.centerY - cur.centerY) < 0.005 && sameSign {
+                        let keeper: PricePoint = {
+                            if cur.hasTaxMarker && !nxt.hasTaxMarker { return cur }
+                            if !cur.hasTaxMarker && nxt.hasTaxMarker { return nxt }
+                            return cur.value <= nxt.value ? cur : nxt
+                        }()
+                        kept.append(keeper)
+                        i += 2
+                        continue
+                    }
+                }
+                kept.append(cur)
+                i += 1
+            }
+            var sum: Decimal = 0
+            var survivors = 0
+            for p in kept {
+                if p.centerY >= totalsBlockY - 0.002 { continue }
+                if totalsValues.contains(p.value) {
+                    let dupesAbove = kept.filter {
+                        $0.value == p.value && $0.centerY < totalsBlockY - 0.002
+                    }.count
+                    let distinctAbove = Set(kept.filter {
+                        $0.centerY < totalsBlockY - 0.002
+                    }.map(\.value)).count
+                    if dupesAbove < 2 || distinctAbove < 2 { continue }
+                }
+                let poisoned = metaLabels.contains { m in
+                    abs(m.y - p.centerY) <= 0.006 && (p.value > 0 || m.isSavingsClass)
+                }
+                if poisoned { continue }
+                sum += p.value
+                survivors += 1
+            }
+            return (sum, survivors)
+        }
+
+        let ocrTargets = Self.ocrTotalsTargets(lines: lines)
+        func sumMatchesTarget(_ sum: Decimal) -> Bool {
+            guard sum > 0 else { return false }
+            let eps = Decimal(string: "0.02")!
+            for t in ocrTargets.totals {
+                if abs(t - sum) <= eps { return true }
+                for tax in ocrTargets.taxes where tax > 0 && tax < t {
+                    if abs(t - (sum + tax)) <= eps { return true }
+                }
+            }
+            return false
+        }
+
+        let medianX: Double = {
+            guard !ocrTargets.totals.isEmpty else { return legacyMedianX }
+            // If the legacy pick already balances against a printed
+            // total, keep it — election exists to rescue receipts whose
+            // column choice is provably wrong, not to second-guess ones
+            // that already reconcile. This is the no-regression gate.
+            let legacySim = simulateColumn(around: legacyMedianX)
+            if sumMatchesTarget(legacySim.sum) { return legacyMedianX }
+            // X clusters, split at gaps > 0.015. Safeway's "Price" and
+            // "You Pay" columns sit as little as ~0.02 apart, so the
+            // split must be finer than the inter-column gap. Election
+            // only makes sense with ≥ 2 plausible columns.
+            var clusters: [[Double]] = []
+            var cur: [Double] = [xs[0]]
+            for x in xs.dropFirst() {
+                if let last = cur.last, x - last > 0.015 {
+                    clusters.append(cur)
+                    cur = [x]
+                } else {
+                    cur.append(x)
+                }
+            }
+            clusters.append(cur)
+            let viable = clusters.filter { $0.count >= 3 }
+            guard viable.count >= 2 else { return legacyMedianX }
+            for cluster in viable.reversed() {
+                let m = cluster[cluster.count / 2]
+                // Paid columns never sit LEFT of the legacy pick's
+                // column — a left-side cluster whose junk happens to
+                // sum to a target (weights, SKU fragments) must not
+                // win. Small tolerance for jitter around equality.
+                guard m >= legacyMedianX - 0.01 else { continue }
+                let sim = simulateColumn(around: m)
+                dbg("COL-CAND: x=\(m) n=\(cluster.count) sum=\(sim.sum) survivors=\(sim.survivors) targets=\(ocrTargets.totals.sorted()) taxes=\(ocrTargets.taxes.sorted())")
+                guard sim.survivors >= 3 else { continue }
+                if sumMatchesTarget(sim.sum) {
+                    dbg("COL-ELECT: x=\(m) sum=\(sim.sum) survivors=\(sim.survivors) (legacy=\(legacyMedianX) legacySum=\(legacySim.sum))")
+                    return m
+                }
+            }
+            // Tax-marker election, when nothing checksums exactly (one
+            // misread digit breaks ±1¢ matching). Safeway-style paid
+            // columns suffix every value with a tax letter ("3.99 S");
+            // the sibling regular-price column never does. A heavily-
+            // marked cluster strictly RIGHT of a nearly-unmarked legacy
+            // pick is definitively the paid column even without a
+            // checksum: paid prices print rightmost, and markers only
+            // ever decorate charged amounts.
+            func markerStats(_ cluster: [Double]) -> (n: Int, marked: Int) {
+                guard let lo = cluster.first, let hi = cluster.last else { return (0, 0) }
+                var n = 0, marked = 0
+                for p in pricePoints where p.box.x >= lo - 0.0001 && p.box.x <= hi + 0.0001 {
+                    n += 1
+                    if p.hasTaxMarker { marked += 1 }
+                }
+                return (n, marked)
+            }
+            let legacyCluster = clusters.first {
+                ($0.first ?? 1) - 0.0001 <= legacyMedianX && legacyMedianX <= ($0.last ?? -1) + 0.0001
+            } ?? []
+            let ls = markerStats(legacyCluster)
+            let legacyMostlyUnmarked = ls.n == 0 || ls.marked * 5 <= ls.n
+            if legacyMostlyUnmarked {
+                for cluster in viable.reversed() {
+                    let m = cluster[cluster.count / 2]
+                    guard m > legacyMedianX + 0.01 else { continue }
+                    let s = markerStats(cluster)
+                    guard s.n >= 5, s.marked * 2 >= s.n else { continue }
+                    dbg("COL-ELECT-MARKER: x=\(m) n=\(s.n) marked=\(s.marked) (legacy=\(legacyMedianX) legacyMarked=\(ls.marked)/\(ls.n))")
+                    return m
+                }
+            }
+            return legacyMedianX
+        }()
+        let columnLo = max(0.0, medianX - 0.05)
+        let columnHi = medianX + 0.05
 
         // Step 5–7: walk surviving prices in Y order.
         let inColumnRaw = pricePoints
@@ -2252,16 +2513,12 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         func reject(_ p: PricePoint) {
             rejects.append(RejectedPricePoint(value: p.value, centerY: p.centerY, box: p.box))
         }
-        if ProcessInfo.processInfo.environment["OCR_DEBUG_COL"] != nil {
-            let msg = "COL: pricePoints=\(pricePoints.count) medianX=\(medianX) inColumn=\(inColumn.count) totalsBlockY=\(totalsBlockY) labelYs=\(labelYs.count)\n"
+        if debugCol {
+            let msg = "COL: pricePoints=\(pricePoints.count) medianX=\(medianX) inColumn=\(inColumn.count) totalsBlockY=\(totalsBlockY) metaLabels=\(metaLabels.count)\n"
             FileHandle.standardError.write(Data(msg.utf8))
             for p in inColumn {
                 FileHandle.standardError.write(Data("  point v=\(p.value) cy=\(p.centerY) x=\(p.box.x)\n".utf8))
             }
-        }
-        let debugCol = ProcessInfo.processInfo.environment["OCR_DEBUG_COL"] != nil
-        func dbg(_ s: String) {
-            if debugCol { FileHandle.standardError.write(Data((s + "\n").utf8)) }
         }
         // Implausibly-large filter setup. The ceiling protects against
         // decimal-lost misreads ("$99" from "$4.99") — but it derives
@@ -2277,6 +2534,14 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         let ceilingFactor: Decimal = hasNegatives ? 3 : 1
         let priceCeiling: Decimal? = {
             guard receiptTotal > 0 else { return nil }
+            // Checksum override: when the column's unceilinged sum
+            // already matches a printed totals value, every point in it
+            // is corroborated by the receipt's own arithmetic — an FM
+            // total small enough to shave points off it is what's wrong
+            // (IMG_5026: FM grabbed the $5.39 savings total, whose
+            // ceiling killed the $6.00 and $6.99 items of a $22.94
+            // BALANCE that the column summed to exactly).
+            if sumMatchesTarget(simulateColumn(around: medianX).sum) { return nil }
             let c = receiptTotal * ceilingFactor
             let over = inColumn.filter { $0.value > c }.count
             return over * 2 <= inColumn.count ? c : nil
@@ -2308,8 +2573,16 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     dbg("SKIP totals-value v=\(p.value)"); continue
                 }
             }
-            // Filter: adjacent to a regular-price / member-savings label.
-            if labelYs.contains(where: { abs($0 - p.centerY) <= 0.006 }) { dbg("SKIP label-adj v=\(p.value)"); reject(p); continue }
+            // Filter: adjacent to a metadata label. Savings-class labels
+            // ("Regular Price", "Member Savings") poison both signs —
+            // the paid amount lives on the item row. Discount-class
+            // labels ("Item Discount") keep their NEGATIVE amount: on
+            // Old Navy-style receipts that IS the line item; only a
+            // positive value on such a row is junk.
+            let labelPoisoned = metaLabels.contains { m in
+                abs(m.y - p.centerY) <= 0.006 && (p.value > 0 || m.isSavingsClass)
+            }
+            if labelPoisoned { dbg("SKIP label-adj v=\(p.value)"); reject(p); continue }
             // Filter: implausibly large value. Vision sometimes mangles a
             // price like "$4.99" into just "99" (decimal point lost). The
             // resulting "$99" exceeds the receipt total and is obviously
@@ -3729,6 +4002,47 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         "health", "beauty", "snacks", "beverages",
     ]
 
+    /// True when `description` is a department name that the receipt
+    /// prints on the SAME row as `price` — i.e. a department-keyed
+    /// ring-up ("DAIRY  8.99 T F"), not a section header. Checks both
+    /// merged observations (name and price in one text) and split
+    /// same-Y observations.
+    fileprivate static func departmentRingUpConfirmed(
+        description: String,
+        price: Decimal,
+        lines: [(text: String, box: Receipt.BBox)]
+    ) -> Bool {
+        guard isDepartmentName(description) else { return false }
+        let needle = description.lowercased().trimmingCharacters(in: .whitespaces)
+        let priceShape = #"^-?\$?-?\d{1,3}(?:,\d{3})*(?:[.,]\d{1,2})(?:\s+[A-Z]){0,2}$"#
+        func value(_ text: String) -> Decimal? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            guard trimmed.range(of: priceShape, options: .regularExpression) != nil else { return nil }
+            let normalized = trimmed
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: #",(?=\d{3}(?:\D|$))"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: ",", with: ".")
+                .replacingOccurrences(of: #"(?:\s+[A-Z])+\s*$"#, with: "", options: .regularExpression)
+            return Decimal(string: normalized, locale: Locale(identifier: "en_US_POSIX"))
+        }
+        for line in lines {
+            let lc = line.text.lowercased()
+            guard lc.contains(needle) else { continue }
+            // Merged form: tokens of this observation carry the price.
+            for tok in line.text.split(whereSeparator: { $0.isWhitespace }) {
+                if value(String(tok)) == price { return true }
+            }
+            // Split form: a separate same-Y price observation.
+            let cy = line.box.y + line.box.height / 2
+            for other in lines {
+                let oy = other.box.y + other.box.height / 2
+                guard abs(oy - cy) <= 0.006 else { continue }
+                if value(other.text) == price { return true }
+            }
+        }
+        return false
+    }
+
     fileprivate static func isDepartmentName(_ text: String) -> Bool {
         let lc = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         return departmentNames.contains(lc)
@@ -3809,6 +4123,16 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         ]
         for sub in nonItemSubstrings {
             if lc.contains(sub) { return true }
+        }
+
+        // Typo'd savings labels, possibly with the amount glued on
+        // ("Menber Savings -0.79", "Meaber Savings", "Reguler Price
+        // 4.28") — the substring list above only catches exact
+        // spellings. Fuzzy-match after stripping a trailing amount.
+        let strippedAmt = Self.strippingTrailingAmount(lc)
+        if strippedAmt.count <= 30,
+           Self.fuzzyMatchesAny(strippedAmt, phrases: Self.savingsClassPhrases) {
+            return true
         }
 
         // Pure percentage descriptions ("6.0000%", "9.375 %") — tax-rate
@@ -4300,6 +4624,18 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                 if debug { FileHandle.standardError.write(Data("DROP fuzzy: |\(line.text)|\n".utf8)) }
                 return false
             }
+            // Same fuzzy check with a trailing amount stripped — faded
+            // Safeway prints merge the savings label AND its value into
+            // one observation ("Menber Savings -0.79") whose length
+            // blows the fuzzy gate. SAVINGS-class only: discount-class
+            // rows ("Item Discount 20.0%") are real negative line items
+            // on Old Navy-style receipts and must stay in the prompt.
+            let strippedAmt = strippingTrailingAmount(lc)
+            if strippedAmt != lc, strippedAmt.count <= 30,
+               fuzzyMatchesAny(strippedAmt, phrases: savingsClassPhrases) {
+                if debug { FileHandle.standardError.write(Data("DROP fuzzy-amt: |\(line.text)|\n".utf8)) }
+                return false
+            }
             if debug && (lc.contains("price") || lc.contains("sav")) {
                 FileHandle.standardError.write(Data("KEEP: |\(line.text)| lc=|\(lc)| bytes=\(Array(lc.utf8))\n".utf8))
             }
@@ -4311,7 +4647,17 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
     /// character edits between the OCR text and any of these, provided
     /// the two lengths are within 2 of each other (otherwise a long real
     /// product name could match by prefix).
-    private static let fuzzyMetadataPhrases: [String] = [
+    ///
+    /// Two classes with different item semantics:
+    ///   * SAVINGS-class rows ANNOTATE a price the receipt already
+    ///     charged elsewhere — Safeway's "Regular Price 4.99" /
+    ///     "Member Savings -1.30" siblings of a paid "3.49 S". Their
+    ///     amounts must never become line items.
+    ///   * DISCOUNT-class rows ("Item Discount -$10.00" on Old Navy)
+    ///     carry a real negative amount that DOES belong in the item
+    ///     list — the printed subtotal only reconciles with them
+    ///     included.
+    private static let savingsClassPhrases: [String] = [
         "regular price",
         "member savings",
         "member saving",
@@ -4325,16 +4671,39 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
         "loyalty discount",
         "sale price",
         "reg price",
+    ]
+    private static let discountClassPhrases: [String] = [
         "item discount",
         "total discount",
     ]
+    private static let fuzzyMetadataPhrases: [String] =
+        savingsClassPhrases + discountClassPhrases
 
-    private static func fuzzyMatchesMetadata(_ lc: String) -> Bool {
-        for phrase in fuzzyMetadataPhrases {
+    private static func fuzzyMatchesAny(_ lc: String, phrases: [String]) -> Bool {
+        for phrase in phrases {
             if abs(lc.count - phrase.count) > 2 { continue }
             if levenshteinDistance(lc, phrase) <= 2 { return true }
         }
         return false
+    }
+
+    private static func fuzzyMatchesMetadata(_ lc: String) -> Bool {
+        fuzzyMatchesAny(lc, phrases: fuzzyMetadataPhrases)
+    }
+
+    /// "menber savings -0.79" → "menber savings": strip ONE trailing
+    /// amount-like token (optional sign, $, %, trailing minus) so a
+    /// metadata label still matches when OCR merges the label and its
+    /// value into a single observation. The merged form defeats both
+    /// the prefix check (typo in the label) and the fuzzy check (the
+    /// amount blows the length-within-2 gate). Returns the input
+    /// unchanged when no amount is present or nothing meaningful
+    /// would remain.
+    fileprivate static func strippingTrailingAmount(_ lc: String) -> String {
+        let pattern = #"[\s:]+[-+]?\$?\d{1,5}(?:[.,]\d{1,3})?%?-?\s*$"#
+        guard let r = lc.range(of: pattern, options: .regularExpression) else { return lc }
+        let head = String(lc[..<r.lowerBound]).trimmingCharacters(in: .whitespaces)
+        return head.count >= 3 ? head : lc
     }
 
     /// Iterative Levenshtein — small strings (< 32 chars) so allocation
