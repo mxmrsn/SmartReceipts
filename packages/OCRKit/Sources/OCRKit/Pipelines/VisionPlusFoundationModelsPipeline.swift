@@ -2639,6 +2639,27 @@ public struct VisionPlusFoundationModelsPipeline: OCRPipeline {
                     i += 2
                     continue
                 }
+                // Unit + extended price of a qty-1 item: the SAME value
+                // printed twice on one visual row in two X columns (a
+                // unit-price column and an extended-price column). Ace
+                // prints "34.99 ... 34.99" for a single CARBONATOR
+                // (IMG_3658), which column-anchored otherwise counts
+                // twice. Distinguish from two same-priced items on
+                // consecutive rows by requiring a horizontal gap: real
+                // stacked items share the SAME X (one column), a
+                // unit/extended pair spans two. Keep the rightmost
+                // (extended) occurrence.
+                let dx = abs(nxt.box.x - cur.box.x)
+                if dy < 0.015 && sameSign && cur.value == nxt.value && dx > 0.02 {
+                    let keeper = cur.box.x >= nxt.box.x ? cur : nxt
+                    let loser = keeper.lineIdx == cur.lineIdx ? nxt : cur
+                    rejects.append(RejectedPricePoint(
+                        value: loser.value, centerY: loser.centerY, box: loser.box
+                    ))
+                    inColumn.append(keeper)
+                    i += 2
+                    continue
+                }
             }
             inColumn.append(cur)
             i += 1
